@@ -7,7 +7,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 ENV UV_SYSTEM_PYTHON=1
 
 COPY pyproject.toml ./
-RUN uv pip install streamlit requests python-dotenv
+RUN uv pip install streamlit requests python-dotenv pandas
 
 COPY . .
 
