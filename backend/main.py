@@ -2,13 +2,15 @@ import os
 from datetime import datetime
 from typing import List
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, DateTime
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.future import select
+from sqlalchemy import text
 from playwright.async_api import async_playwright
 import httpx
 
@@ -29,12 +31,29 @@ class ScrapedPDF(Base):
     source_url = Column(String, unique=True, index=True, nullable=False)
     download_date = Column(DateTime, default=datetime.utcnow)
     size_bytes = Column(Integer, nullable=False)
+    parent_target_url = Column(String, index=True, nullable=True)
+
+class ScrapedTarget(Base):
+    __tablename__ = "scraped_targets"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    target_url = Column(String, unique=True, index=True, nullable=False)
+    last_scraped_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    total_pdfs_found = Column(Integer, default=0)
 
 # Create tables if not exist
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        
+    # Runtime minor DB manual migration to persist prior data mapping
+    # Must be in a separate isolated transaction so Postgres doesn't abort table creation if it fails
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE scraped_pdfs ADD COLUMN parent_target_url VARCHAR;"))
+    except Exception:
+        pass # Column already exists
 
 # Ensure the local pdf directory exists with permissive writing rules
 PDF_DIR = "/data/pdfs"
@@ -45,6 +64,9 @@ os.chmod(PDF_DIR, 0o777)
 app.mount("/pdfs", StaticFiles(directory=PDF_DIR), name="pdfs")
 
 # --- Pydantic Schemas ---
+
+class ScrapeRequest(BaseModel):
+    url: str
 
 class ScrapeResult(BaseModel):
     message: str
@@ -61,13 +83,70 @@ class PDFResponse(BaseModel):
     class Config:
         orm_mode = True
 
+class TargetResponse(BaseModel):
+    id: int
+    target_url: str
+    last_scraped_date: datetime
+    total_pdfs_found: int
+
+    class Config:
+        orm_mode = True
+
 # --- Scraper Logic ---
 
-async def run_merlin_scraper() -> dict:
-    url = "https://ir.merlinproperties.com/inversores/informacion-financiera/"
+async def run_merlin_scraper(target_url: str) -> dict:
     downloaded = 0
     skipped = 0
     
+    # 1. Validación Directa: Si es un PDF suelto, evitamos Playwright
+    if target_url.lower().strip().endswith(".pdf"):
+        async with AsyncSessionLocal() as session:
+            # Check idempotency
+            result_idemp = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.source_url == target_url))
+            if result_idemp.scalars().first():
+                skipped += 1
+            else:
+                try:
+                    filename = target_url.split("/")[-1].split("?")[0]
+                    if not filename.lower().endswith(".pdf"):
+                        filename = "document_direct.pdf"
+                        
+                    save_path = os.path.join(PDF_DIR, filename)
+                    
+                    async with httpx.AsyncClient(verify=False) as client:
+                        req = await client.get(target_url, timeout=60.0)
+                        req.raise_for_status()
+                        with open(save_path, "wb") as f:
+                            f.write(req.content)
+                            
+                    size_bytes = os.path.getsize(save_path)
+                    
+                    new_pdf = ScrapedPDF(
+                        filename=filename, 
+                        source_url=target_url, 
+                        size_bytes=size_bytes,
+                        parent_target_url=target_url
+                    )
+                    session.add(new_pdf)
+                    await session.commit()
+                    downloaded += 1
+                except Exception as e:
+                    raise Exception(f"Falla en descarga directa: {str(e)}")
+                    
+            # Upsert Target
+            result_target = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.target_url == target_url))
+            existing_target = result_target.scalars().first()
+            if existing_target:
+                existing_target.last_scraped_date = datetime.utcnow()
+                existing_target.total_pdfs_found += downloaded
+            else:
+                session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=downloaded))
+            await session.commit()
+            
+        return {"downloaded_count": downloaded, "skipped_count": skipped, "message": "Direct PDF download complete"}
+
+    
+    # Lógica con Playwright
     async with async_playwright() as p:
         # slow_mo: 1000 añade 1 segundo de retraso obligatorio entre cada acción de Playwright
         browser = await p.chromium.launch(headless=True, slow_mo=1000)
@@ -82,7 +161,7 @@ async def run_merlin_scraper() -> dict:
         page = await context.new_page()
         
         # Simulamos un timeout generoso
-        await page.goto(url, wait_until="networkidle", timeout=60000)
+        await page.goto(target_url, wait_until="networkidle", timeout=60000)
         
         # Give it a bit more time to render initial JS links
         await page.wait_for_timeout(3000)
@@ -175,7 +254,8 @@ async def run_merlin_scraper() -> dict:
                     new_pdf = ScrapedPDF(
                         filename=filename,
                         source_url=pdf_url,
-                        size_bytes=size_bytes
+                        size_bytes=size_bytes,
+                        parent_target_url=target_url
                     )
                     session.add(new_pdf)
                     await session.commit()
@@ -183,6 +263,20 @@ async def run_merlin_scraper() -> dict:
                     print(f"Éxito: {filename} ({size_bytes} bytes)")
                 except Exception as e:
                     print(f"Failed to direct download {pdf_url}: {e}")
+            
+            # Upsert the Target Tracking history
+            result_target = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.target_url == target_url))
+            existing_target = result_target.scalars().first()
+            if existing_target:
+                existing_target.last_scraped_date = datetime.utcnow()
+                existing_target.total_pdfs_found += downloaded
+            else:
+                new_target = ScrapedTarget(
+                    target_url=target_url,
+                    total_pdfs_found=downloaded
+                )
+                session.add(new_target)
+            await session.commit()
                     
         await browser.close()
         
@@ -196,9 +290,43 @@ def read_root():
     return {"message": "Playwright Merlin Scraper is Ready", "db_url": DATABASE_URL}
 
 @app.post("/run-scraper", response_model=ScrapeResult)
-async def api_run_scraper():
-    result = await run_merlin_scraper()
-    return result
+async def api_run_scraper(req: ScrapeRequest):
+    try:
+        result = await run_merlin_scraper(req.url)
+        return result
+    except Exception as e:
+        print(f"Error scraping {req.url}: {e}")
+        return JSONResponse(
+            status_code=400, 
+            content={'error': 'No se pudo procesar la URL. Asegúrate de que es una web válida o un enlace directo a PDF'}
+        )
+
+@app.post("/run-scraper-all")
+async def api_run_scraper_all():
+    total_downloaded = 0
+    total_skipped = 0
+    errors = []
+    
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ScrapedTarget))
+        targets = result.scalars().all()
+        urls_to_scrape = [t.target_url for t in targets]
+        
+    for url in urls_to_scrape:
+        try:
+            res = await run_merlin_scraper(url)
+            total_downloaded += res["downloaded_count"]
+            total_skipped += res["skipped_count"]
+        except Exception as e:
+            print(f"Failed scraping {url} in bulk run: {e}")
+            errors.append(url)
+            
+    return {
+        "message": "Scraping masivo completado",
+        "downloaded_count": total_downloaded,
+        "skipped_count": total_skipped,
+        "errors": errors
+    }
 
 @app.get("/api/pdfs", response_model=List[PDFResponse])
 async def list_pdfs():
@@ -206,3 +334,42 @@ async def list_pdfs():
         result = await session.execute(select(ScrapedPDF).order_by(ScrapedPDF.download_date.desc()))
         pdfs = result.scalars().all()
         return pdfs
+
+@app.get("/api/targets", response_model=List[TargetResponse])
+async def list_targets():
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ScrapedTarget).order_by(ScrapedTarget.last_scraped_date.desc()))
+        targets = result.scalars().all()
+        return targets
+
+@app.delete("/api/targets/{target_id}")
+async def delete_target(target_id: int):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.id == target_id))
+        target = result.scalars().first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target tracking not found")
+        
+        # Pull everything bound to this parent domain
+        pdfs_result = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.parent_target_url == target.target_url))
+        pdfs = pdfs_result.scalars().all()
+        
+        purged_files = 0
+        for pdf in pdfs:
+            # 1. Unlink physical binary
+            try:
+                physical_path = os.path.join(PDF_DIR, pdf.filename)
+                if os.path.exists(physical_path):
+                    os.remove(physical_path)
+                purged_files += 1
+            except Exception as fe:
+                print(f"File physical kill failed on {pdf.filename}: {fe}")
+            
+            # 2. Obliterate from relations
+            await session.delete(pdf)
+            
+        # Obliterate actual domain tracker block 
+        await session.delete(target)
+        await session.commit()
+        
+    return {"message": "Cascade purge effective", "pdfs_deleted": purged_files, "target_freed": target.target_url}
