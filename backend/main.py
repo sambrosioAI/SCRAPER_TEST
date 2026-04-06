@@ -13,6 +13,8 @@ from sqlalchemy.future import select
 from sqlalchemy import text
 from playwright.async_api import async_playwright
 import httpx
+import re
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
 app = FastAPI(title="Merlin Scraper Backend")
 
@@ -182,31 +184,95 @@ async def run_merlin_scraper(target_url: str) -> dict:
         await page.wait_for_timeout(4000)
         print("Finalizada la expansión de acordeones. Buscando PDFs...")
         
-        # Find all <a> tags blindly and check href inside Python to bypass strict CSS constraints
+        from urllib.parse import urlparse
+        parsed = urlparse(target_url)
+        base_domain = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Find all <a> tags blindly
         all_links = await page.locator("a").all()
         target_pdfs = []
+        
         for link in all_links:
             try:
                 href = await link.get_attribute("href")
                 if href and ".pdf" in href.lower():
                     if not href.startswith("http"):
-                        # Handle relative URLs just in case
+                        # Handle relative URLs dynamically mapped to their parent origin
                         if href.startswith("/"):
-                            href = f"https://ir.merlinproperties.com{href}"
+                            href = f"{base_domain}{href}"
                         else:
-                            href = f"https://ir.merlinproperties.com/{href}"
+                            href = f"{base_domain}/{href}"
                     target_pdfs.append(href)
             except Exception:
                 continue
         
         # Filter duplicates
         target_pdfs = list(set(target_pdfs))
-        print(f"Total de enlaces PDF únicos extraídos para chequear: {len(target_pdfs)}")
+        print(f"Total de enlaces PDF únicos extraídos para chequear (Natívamente): {len(target_pdfs)}")
         
-        # Si encuentra 0 enlaces, tomamos captura de depuración
+        # --- ESTRATEGIA DE FALLBACK CRAWLEE (DEEP SCAN) ---
+        if len(target_pdfs) == 0:
+            print("Playwright clásico no encontró PDFs. Iniciando Crawlee Deep Scan Fallback...")
+            crawlee_pdfs = []
+            
+            # Instanciamos el Crawler nativo con los parámetros de optimización para Docker (2 workers)
+            crawler = PlaywrightCrawler(
+                max_concurrency=2,
+                headless=True,
+                browser_type_launch_options={
+                    "args": ['--no-sandbox', '--disable-setuid-sandbox']
+                }
+            )
+            
+            @crawler.router.default_handler
+            async def request_handler(ctx: PlaywrightCrawlingContext) -> None:
+                url = ctx.request.url
+                
+                # Descarte rápido vía regex para procesar encolados documentales ofimáticos
+                if re.search(r'\.(pdf|xlsx|xls|zip)$', url, re.IGNORECASE):
+                    print(f"[Crawlee] DeepScan recolectó posible match: {url}")
+                    # PERO estrictamente limitamos las descargas exclusivas a .pdf según el requerimiento
+                    if url.lower().endswith(".pdf"):
+                        crawlee_pdfs.append(url)
+                    return
+                
+                # Lógica recursiva de penetración de acordeones y Deep Search (HTML Page)
+                try:
+                    page = ctx.page
+                    await page.wait_for_load_state("networkidle", timeout=30000)
+                    
+                    # Forzar despliegue nativo mediante inyección JS
+                    print(f"[Crawlee] Explotando menú en profundidad: {url}")
+                    await page.evaluate("""() => {
+                        const targets = document.querySelectorAll('button, div, span, a');
+                        targets.forEach(el => {
+                            const txt = el.innerText || '';
+                            const cls = el.className || '';
+                            if (txt.match(/20[1-3][0-9]/) || cls.match(/accordion|expand|v-icon|toggle/i)) {
+                                try { el.click(); } catch (e) {}
+                            }
+                        });
+                    }""")
+                    
+                    # Dar un respiro a que se carguen los nodos hijos e inyectar regex dinámicamente:
+                    await page.wait_for_timeout(3500)
+                except Exception as e_deep:
+                    print(f"[Crawlee Error] Falló DeepScan parse JS en {url}: {e_deep}")
+                
+                # Una vez la página está expandida al máximo nivel, meteremos a cola Crawlee los enlaces relevantes
+                await ctx.enqueue_links(
+                    regex=r".*\.(pdf|xlsx|xls|zip)$"
+                )
+            
+            # Encender el Scanner y aguardar resultados!
+            await crawler.run([target_url])
+            target_pdfs = list(set(crawlee_pdfs))
+            print(f"Crawler Rescató orgánicamente {len(target_pdfs)} ENLACES validables PDF.")
+
+        # Si tras ambos métodos sigue arrojando nulo, tomamos captura de depuración
         if len(target_pdfs) == 0:
             screenshot_path = os.path.join(PDF_DIR, "debug.png")
-            print(f"Cero enlaces encontrados. Tomando captura en: {screenshot_path}")
+            print(f"Cero enlaces encontrados finalmente. Tomando captura en: {screenshot_path}")
             await page.screenshot(path=screenshot_path, full_page=True)
 
         async with AsyncSessionLocal() as session:
