@@ -1,23 +1,7 @@
 version: '3.8'
 
 services:
-  db:
-    image: postgres:15-alpine
-    container_name: scraper_db
-    restart: always
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - "${POSTGRES_PORT}:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+
 
   backend:
     build:
@@ -27,13 +11,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_URL: sqlite+aiosqlite:////data/scraper.db
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
     volumes:
-      - ./data/pdfs:/data/pdfs
-    depends_on:
-      db:
-        condition: service_healthy
+      - ./data:/data
 
   frontend:
     build:
@@ -47,5 +28,4 @@ services:
     depends_on:
       - backend
 
-volumes:
-  postgres_data:
+

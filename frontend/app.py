@@ -55,29 +55,32 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader("🌐 Añadir nueva url de rastreo")
-    target_url = st.text_input("URL Objetivo para el Scraper", value="", placeholder="Introduce la dirección web...")
     
-    if st.button("🔍 Iniciar Scraping", type="primary"):
-        parsed = urlparse(target_url)
-        # Validar URL
-        if not target_url.strip() or not parsed.scheme or not parsed.netloc:
-            st.error("⚠️ Error: La URL proporcionada no es válida. Asegúrate de incluir http:// o https://")
-        else:
-            with st.spinner(f"Analizando {target_url} con Playwright (esto puede tardar unos minutos)..."):
-                try:
-                    res = requests.post(f"{backend_url}/run-scraper", json={"url": target_url})
-                    if res.status_code == 200:
-                        data = res.json()
-                        st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (ya existían en BBDD): **{data['skipped_count']}**")
-                        get_pdfs.clear()
-                        get_targets.clear()
-                    elif res.status_code == 400:
-                        err_data = res.json()
-                        st.error(f"⚠️ {err_data.get('error', 'Error reportado por el backend.')}")
-                    else:
-                        st.error(f"Error en el backend: {res.status_code} - {res.text}")
-                except Exception as e:
-                    st.error(f"Error de conexión: {e}")
+    with st.form("scraper_form", clear_on_submit=True):
+        target_url = st.text_input("URL Objetivo para el Scraper", value="", placeholder="Introduce la dirección web...")
+        submitted = st.form_submit_button("🔍 Iniciar Scraping", type="primary")
+        
+        if submitted:
+            parsed = urlparse(target_url)
+            # Validar URL
+            if not target_url.strip() or not parsed.scheme or not parsed.netloc:
+                st.error("⚠️ Error: La URL proporcionada no es válida. Asegúrate de incluir http:// o https://")
+            else:
+                with st.spinner(f"Analizando {target_url} con Playwright (esto puede tardar unos minutos)..."):
+                    try:
+                        res = requests.post(f"{backend_url}/run-scraper", json={"url": target_url})
+                        if res.status_code == 200:
+                            data = res.json()
+                            st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (ya existían en BBDD): **{data['skipped_count']}**")
+                            get_pdfs.clear()
+                            get_targets.clear()
+                        elif res.status_code == 400:
+                            err_data = res.json()
+                            st.error(f"⚠️ {err_data.get('error', 'Error reportado por el backend.')}")
+                        else:
+                            st.error(f"Error en el backend: {res.status_code} - {res.text}")
+                    except Exception as e:
+                        st.error(f"Error de conexión: {e}")
 
 with col2:
     st.subheader("🕸️ Webs Rastreadas Anteriormente")
@@ -85,13 +88,29 @@ with col2:
     if not targets_data:
         st.info("Aún no se ha rastreado ninguna URL base.")
     else:
-        st.write("*(Borrar una web purgará sus PDFs nativos asociados del disco)*")
+        st.write("*(Gestiona y restrea tus enlaces históricos de forma perimetral)*")
         for t in targets_data:
-            c_meta, c_btn = st.columns([5, 1])
+            c_meta, c_btn_rescrape, c_btn_del = st.columns([4, 1, 1])
             with c_meta:
                 date_str = pd.to_datetime(t["last_scraped_date"]).strftime("%Y-%m-%d %H:%M")
                 st.markdown(f"**URL:** `{t['target_url']}`  \n**Archivos:** {t['total_pdfs_found']} &nbsp;&nbsp;|&nbsp;&nbsp; **Actualizado:** {date_str}")
-            with c_btn:
+            with c_btn_rescrape:
+                if st.button("🚀", key=f"rescrape_{t['id']}", help="Volver a rastrear exclusivamente esta URL (Extraerá archivos nuevos omitiendo los que ya existan)"):
+                    with st.spinner("Rastreando..."):
+                        try:
+                            res = requests.post(f"{backend_url}/run-scraper", json={"url": t['target_url']})
+                            if res.status_code == 200:
+                                get_pdfs.clear()
+                                get_targets.clear()
+                                st.rerun()
+                            elif res.status_code == 400:
+                                err_data = res.json()
+                                st.error(f"⚠️ {err_data.get('error', 'Fallo')}")
+                            else:
+                                st.error(str(res.text))
+                        except Exception as e:
+                            st.error(str(e))
+            with c_btn_del:
                 if st.button("🗑️", key=f"del_{t['id']}", help="Elimina esta web y destruye físicamente sus PDFs"):
                     with st.spinner("Purgando enlace..."):
                         try:

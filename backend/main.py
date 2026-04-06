@@ -46,14 +46,6 @@ class ScrapedTarget(Base):
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        
-    # Runtime minor DB manual migration to persist prior data mapping
-    # Must be in a separate isolated transaction so Postgres doesn't abort table creation if it fails
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text("ALTER TABLE scraped_pdfs ADD COLUMN parent_target_url VARCHAR;"))
-    except Exception:
-        pass # Column already exists
 
 # Ensure the local pdf directory exists with permissive writing rules
 PDF_DIR = "/data/pdfs"
