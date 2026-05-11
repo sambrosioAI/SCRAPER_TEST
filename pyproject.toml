@@ -7,6 +7,15 @@ requires-python = ">=3.14"
 dependencies = [
     "openai",
     "python-dotenv",
+    "fastapi",
+    "uvicorn",
+    "playwright",
+    "sqlalchemy",
+    "aiosqlite",
+    "pydantic-settings",
+    "httpx",
+    "crawlee[playwright]",
+    "Office365-REST-Python-Client",
 ]
 
 [project.scripts]

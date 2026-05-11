@@ -13,7 +13,7 @@ ENV UV_SYSTEM_PYTHON=1
 
 # Install Project dependencies
 COPY pyproject.toml ./
-RUN uv pip install fastapi uvicorn playwright sqlalchemy aiosqlite pydantic-settings python-dotenv httpx "crawlee[playwright]"
+RUN uv pip install fastapi uvicorn playwright sqlalchemy aiosqlite pydantic-settings python-dotenv httpx "crawlee[playwright]" Office365-REST-Python-Client
 
 # Install Playwright OS dependencies and chromium
 RUN playwright install --with-deps chromium

@@ -11,11 +11,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: sqlite+aiosqlite:////data/scraper.db
+      DATABASE_URL: sqlite+aiosqlite:///scraper.db
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-    volumes:
-      - ./data:/data
-
+      TENANT_ID: ${TENANT_ID}
+      CLIENT_ID: ${CLIENT_ID}
+      CLIENT_SECRET: ${CLIENT_SECRET}
+      SHAREPOINT_SITE_URL: ${SHAREPOINT_SITE_URL}
   frontend:
     build:
       context: ./frontend

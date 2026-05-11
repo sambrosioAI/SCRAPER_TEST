@@ -2,10 +2,10 @@ import os
 from datetime import datetime
 from typing import List
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Response
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from office365.sharepoint.files.file import File
 from sqlalchemy import Column, Integer, String, DateTime
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -14,14 +14,98 @@ from sqlalchemy import text
 from playwright.async_api import async_playwright
 import httpx
 import re
+from urllib.parse import urlparse
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
 app = FastAPI(title="Merlin Scraper Backend")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///scraper.db")
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
+
+SHAREPOINT_SITE_URL = os.getenv("SHAREPOINT_SITE_URL")
+TENANT_ID = os.getenv("TENANT_ID")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+# Standard internal name for "Documentos compartidos" is usually "Shared Documents"
+SP_PDF_FOLDER = "Shared Documents/data/pdfs"
+SP_DB_FOLDER = "Shared Documents/data"
+LOCAL_DB_PATH = "scraper.db"
+
+async def get_graph_token():
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, data=data)
+        resp.raise_for_status()
+        return resp.json().get("access_token")
+
+async def get_site_info(client, headers):
+    parsed = urlparse(SHAREPOINT_SITE_URL)
+    hostname = parsed.hostname
+    site_path = parsed.path.strip('/')
+    
+    # Try 1: Direct path lookup
+    site_url = f"https://graph.microsoft.com/v1.0/sites/{hostname}:/{site_path}"
+    resp = await client.get(site_url, headers=headers)
+    if resp.status_code == 200:
+        return resp.json().get("id")
+        
+    # Try 2: Search fallback
+    site_name = site_path.split('/')[-1]
+    search_url = f"https://graph.microsoft.com/v1.0/sites?search={site_name}"
+    resp = await client.get(search_url, headers=headers)
+    if resp.status_code == 200:
+        results = resp.json().get("value", [])
+        for site in results:
+            if site_name.lower() in site.get("name", "").lower() or site_name.lower() in site.get("displayName", "").lower():
+                return site.get("id")
+    
+    resp.raise_for_status()
+    return None
+
+async def upload_to_sp(filename: str, content: bytes, folder_path: str):
+    try:
+        token = await get_graph_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        async with httpx.AsyncClient() as client:
+            site_id = await get_site_info(client, headers)
+            
+            # 2. Get Drive ID
+            drive_resp = await client.get(f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive", headers=headers)
+            drive_resp.raise_for_status()
+            drive_id = drive_resp.json().get("id")
+            
+            # 3. Upload File
+            graph_folder = folder_path.replace("Shared Documents/", "").replace("Documents/", "").strip("/")
+            upload_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{graph_folder}/{filename}:/content"
+            put_resp = await client.put(upload_url, headers=headers, content=content)
+            put_resp.raise_for_status()
+            
+        print(f"Archivo {filename} subido con éxito a SharePoint (Graph REST).")
+    except Exception as e:
+        print(f"Error subiendo {filename} a SharePoint (Graph REST): {e}")
+
+def sync_db_to_sp():
+    # Helper to run async upload from sync context
+    import asyncio
+    try:
+        with open(LOCAL_DB_PATH, "rb") as f:
+            content = f.read()
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(upload_to_sp(LOCAL_DB_PATH, content, SP_DB_FOLDER))
+        else:
+            asyncio.run(upload_to_sp(LOCAL_DB_PATH, content, SP_DB_FOLDER))
+    except Exception as e:
+        print(f"Error en sync_db_to_sp: {e}")
 
 # --- Database Models ---
 
@@ -46,16 +130,32 @@ class ScrapedTarget(Base):
 # Create tables if not exist
 @app.on_event("startup")
 async def startup():
+    try:
+        token = await get_graph_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        async with httpx.AsyncClient() as client:
+            site_id = await get_site_info(client, headers)
+            
+            drive_resp = await client.get(f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive", headers=headers)
+            drive_resp.raise_for_status()
+            drive_id = drive_resp.json().get("id")
+            
+            graph_folder = SP_DB_FOLDER.replace("Shared Documents/", "").replace("Documents/", "").strip("/")
+            download_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{graph_folder}/{LOCAL_DB_PATH}:/content"
+            
+            dl_resp = await client.get(download_url, headers=headers, follow_redirects=True)
+            if dl_resp.status_code == 200:
+                with open(LOCAL_DB_PATH, "wb") as f:
+                    f.write(dl_resp.content)
+                print("Base de datos descargada de SharePoint (Graph REST).")
+    except Exception as e:
+        print(f"No se pudo descargar la base de datos de SharePoint (Graph REST): {e}")
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-# Ensure the local pdf directory exists with permissive writing rules
-PDF_DIR = "/data/pdfs"
-os.makedirs(PDF_DIR, exist_ok=True)
-os.chmod(PDF_DIR, 0o777)
-
-# Serve the PDF directory
-app.mount("/pdfs", StaticFiles(directory=PDF_DIR), name="pdfs")
+# PDFs will be served directly from SharePoint
 
 # --- Pydantic Schemas ---
 
@@ -75,7 +175,7 @@ class PDFResponse(BaseModel):
     size_bytes: int
     
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class TargetResponse(BaseModel):
     id: int
@@ -84,7 +184,7 @@ class TargetResponse(BaseModel):
     total_pdfs_found: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 # --- Scraper Logic ---
 
@@ -105,15 +205,15 @@ async def run_merlin_scraper(target_url: str) -> dict:
                     if not filename.lower().endswith(".pdf"):
                         filename = "document_direct.pdf"
                         
-                    save_path = os.path.join(PDF_DIR, filename)
-                    
                     async with httpx.AsyncClient(verify=False) as client:
                         req = await client.get(target_url, timeout=60.0)
                         req.raise_for_status()
-                        with open(save_path, "wb") as f:
-                            f.write(req.content)
+                        file_content = req.content
                             
-                    size_bytes = os.path.getsize(save_path)
+                    size_bytes = len(file_content)
+                    
+                    # Subir a SharePoint via Graph REST
+                    await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
                     
                     new_pdf = ScrapedPDF(
                         filename=filename, 
@@ -137,6 +237,7 @@ async def run_merlin_scraper(target_url: str) -> dict:
                 session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=downloaded))
             await session.commit()
             
+        sync_db_to_sp()
         return {"downloaded_count": downloaded, "skipped_count": skipped, "message": "Direct PDF download complete"}
 
     
@@ -271,7 +372,7 @@ async def run_merlin_scraper(target_url: str) -> dict:
 
         # Si tras ambos métodos sigue arrojando nulo, tomamos captura de depuración
         if len(target_pdfs) == 0:
-            screenshot_path = os.path.join(PDF_DIR, "debug.png")
+            screenshot_path = "debug.png"
             print(f"Cero enlaces encontrados finalmente. Tomando captura en: {screenshot_path}")
             await page.screenshot(path=screenshot_path, full_page=True)
 
@@ -295,18 +396,17 @@ async def run_merlin_scraper(target_url: str) -> dict:
                     if not filename.lower().endswith(".pdf"):
                         filename = f"document_{downloaded}.pdf"
                         
-                    save_path = os.path.join(PDF_DIR, filename)
-                    
                     async with httpx.AsyncClient(cookies=cookies_dict, verify=False) as client:
                         headers = {"User-Agent": fake_user_agent}
                         print(f"Descargando directamente con httpx: {filename}")
                         req = await client.get(pdf_url, headers=headers, timeout=60.0)
                         req.raise_for_status()
-                        
-                        with open(save_path, "wb") as f:
-                            f.write(req.content)
+                        file_content = req.content
                             
-                    size_bytes = os.path.getsize(save_path)
+                    size_bytes = len(file_content)
+                    
+                    # Subir a SharePoint via Graph REST
+                    await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
                     
                     # 3. Save to DB
                     new_pdf = ScrapedPDF(
@@ -338,6 +438,7 @@ async def run_merlin_scraper(target_url: str) -> dict:
                     
         await browser.close()
         
+    sync_db_to_sp()
     return {"downloaded_count": downloaded, "skipped_count": skipped, "message": "Scraping complete"}
 
 
@@ -346,6 +447,29 @@ async def run_merlin_scraper(target_url: str) -> dict:
 @app.get("/")
 def read_root():
     return {"message": "Playwright Merlin Scraper is Ready", "db_url": DATABASE_URL}
+
+@app.get("/pdfs/{filename}")
+async def serve_pdf(filename: str):
+    try:
+        token = await get_graph_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        async with httpx.AsyncClient() as client:
+            site_id = await get_site_info(client, headers)
+            
+            drive_resp = await client.get(f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive", headers=headers)
+            drive_resp.raise_for_status()
+            drive_id = drive_resp.json().get("id")
+            
+            graph_folder = SP_PDF_FOLDER.replace("Shared Documents/", "").replace("Documents/", "").strip("/")
+            download_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{graph_folder}/{filename}:/content"
+            
+            dl_resp = await client.get(download_url, headers=headers, follow_redirects=True)
+            dl_resp.raise_for_status()
+            return Response(content=dl_resp.content, media_type="application/pdf")
+    except Exception as e:
+        print(f"Error sirviendo PDF {filename} (Graph REST): {e}")
+        raise HTTPException(status_code=404, detail=f"Archivo no encontrado en SharePoint: {e}")
 
 @app.post("/run-scraper", response_model=ScrapeResult)
 async def api_run_scraper(req: ScrapeRequest):
@@ -413,15 +537,17 @@ async def delete_target(target_id: int):
         pdfs = pdfs_result.scalars().all()
         
         purged_files = 0
+        ctx = get_sp_context()
         for pdf in pdfs:
-            # 1. Unlink physical binary
+            # 1. Unlink physical binary from SharePoint
             try:
-                physical_path = os.path.join(PDF_DIR, pdf.filename)
-                if os.path.exists(physical_path):
-                    os.remove(physical_path)
+                file_url = f"{SP_PDF_FOLDER}/{pdf.filename}"
+                file = ctx.web.get_file_by_server_relative_path(file_url)
+                file.delete_object()
+                ctx.execute_query()
                 purged_files += 1
             except Exception as fe:
-                print(f"File physical kill failed on {pdf.filename}: {fe}")
+                print(f"File physical kill failed on SP {pdf.filename}: {fe}")
             
             # 2. Obliterate from relations
             await session.delete(pdf)
@@ -430,4 +556,5 @@ async def delete_target(target_id: int):
         await session.delete(target)
         await session.commit()
         
+    sync_db_to_sp()
     return {"message": "Cascade purge effective", "pdfs_deleted": purged_files, "target_freed": target.target_url}
