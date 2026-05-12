@@ -537,20 +537,38 @@ async def delete_target(target_id: int):
         pdfs = pdfs_result.scalars().all()
         
         purged_files = 0
-        ctx = get_sp_context()
-        for pdf in pdfs:
-            # 1. Unlink physical binary from SharePoint
-            try:
-                file_url = f"{SP_PDF_FOLDER}/{pdf.filename}"
-                file = ctx.web.get_file_by_server_relative_path(file_url)
-                file.delete_object()
-                ctx.execute_query()
-                purged_files += 1
-            except Exception as fe:
-                print(f"File physical kill failed on SP {pdf.filename}: {fe}")
+        try:
+            token = await get_graph_token()
+            headers = {"Authorization": f"Bearer {token}"}
             
-            # 2. Obliterate from relations
-            await session.delete(pdf)
+            async with httpx.AsyncClient() as client:
+                site_id = await get_site_info(client, headers)
+                drive_resp = await client.get(f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive", headers=headers)
+                drive_resp.raise_for_status()
+                drive_id = drive_resp.json().get("id")
+                
+                graph_folder = SP_PDF_FOLDER.replace("Shared Documents/", "").replace("Documents/", "").strip("/")
+
+                for pdf in pdfs:
+                    # 1. Unlink physical binary from SharePoint via Graph REST
+                    try:
+                        delete_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{graph_folder}/{pdf.filename}"
+                        del_resp = await client.delete(delete_url, headers=headers)
+                        # 204 No Content is success for DELETE
+                        if del_resp.status_code in [200, 204]:
+                            purged_files += 1
+                        else:
+                            print(f"Graph Delete failed for {pdf.filename}: {del_resp.status_code}")
+                    except Exception as fe:
+                        print(f"File physical kill failed on SP {pdf.filename}: {fe}")
+                    
+                    # 2. Obliterate from database relations
+                    await session.delete(pdf)
+        except Exception as e:
+            print(f"Error global en purga de SharePoint: {e}")
+            # Even if SP fails, we might want to continue deleting from DB, but 
+            # let's stay safe and only delete from DB what we attempted to delete from SP.
+            # In this case, the loop above handles DB deletion per file.
             
         # Obliterate actual domain tracker block 
         await session.delete(target)
