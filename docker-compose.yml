@@ -10,6 +10,9 @@ services:
     restart: always
     ports:
       - "8000:8000"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       DATABASE_URL: sqlite+aiosqlite:///scraper.db
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
@@ -17,6 +20,7 @@ services:
       CLIENT_ID: ${CLIENT_ID}
       CLIENT_SECRET: ${CLIENT_SECRET}
       SHAREPOINT_SITE_URL: ${SHAREPOINT_SITE_URL}
+      SHAREPOINT_SITE_ID: ${SHAREPOINT_SITE_ID}
   frontend:
     build:
       context: ./frontend
@@ -24,6 +28,9 @@ services:
     restart: always
     ports:
       - "8501:8501"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       BACKEND_URL: http://backend:8000
     depends_on:

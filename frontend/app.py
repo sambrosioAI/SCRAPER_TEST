@@ -71,7 +71,7 @@ with col1:
                         res = requests.post(f"{backend_url}/run-scraper", json={"url": target_url})
                         if res.status_code == 200:
                             data = res.json()
-                            st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (ya existían en BBDD): **{data['skipped_count']}**")
+                            st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
                             get_pdfs.clear()
                             get_targets.clear()
                         elif res.status_code == 400:
