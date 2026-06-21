@@ -90,7 +90,7 @@ with col1:
     except:
         pass
 
-    st.write("**Área Solicitante (para nuevos documentos)**")
+    st.write("**Área Solicitante (SharePoint)**")
     area_scrap_options = ["-- Sin Asignar --"] + [f"{a['label']}|{a['id']}" for a in areas_scrap]
     selected_scrap_area = st.selectbox(
         "Selecciona el Área para el Scrap:",
@@ -99,7 +99,7 @@ with col1:
         key="scrap_area_widget"
     )
     
-    st.write("**Empresa Estudiada (para nuevos documentos)**")
+    st.write("**Empresa Estudiada (SharePoint)**")
     emp_scrap_options = ["-- Sin Asignar --"] + [f"{e['label']}|{e['id']}" for e in empresas_scrap]
     selected_scrap_emp = st.selectbox(
         "Selecciona la Empresa para el Scrap:",
@@ -127,7 +127,7 @@ with col1:
                             st.error(f"Error creando término: {res_new_term.text}")
                     except Exception as ex:
                         st.error(f"Excepción: {ex}")
-
+ 
     target_url = st.text_input("URL Objetivo para el Scraper", value="", placeholder="Introduce la dirección web...", key=f"scrap_target_url_input_{st.session_state.target_url_counter}")
     
     is_area_assigned = (selected_scrap_area != "-- Sin Asignar --")
@@ -142,45 +142,48 @@ with col1:
     if not is_url_provided:
         st.info("💡 Introduce la URL de destino arriba para comenzar.")
         
-    button_enabled = is_area_assigned and is_empresa_assigned and is_url_provided
+    button_enabled = is_area_assigned and is_empresa_assigned
     
     submitted = st.button("🔍 Iniciar Scraping", type="primary", disabled=not button_enabled, key="run_scraping_btn_widget")
     
     if submitted:
-        parsed = urlparse(target_url)
-        # Validar URL
-        if not parsed.scheme or not parsed.netloc:
-            st.error("⚠️ Error: La URL proporcionada no es válida. Asegúrate de incluir http:// o https://")
+        if not target_url.strip():
+            st.error("⚠️ Por favor, introduce una URL para iniciar el scraping.")
         else:
-            with st.spinner(f"Analizando {target_url} con Playwright (esto puede tardar unos minutos)..."):
-                try:
-                    res = requests.post(
-                        f"{backend_url}/run-scraper", 
-                        json={
-                            "url": target_url,
-                            "area_tag": selected_scrap_area,
-                            "empresa_tag": selected_scrap_emp
-                        }
-                    )
-                    if res.status_code == 200:
-                        data = res.json()
-                        st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
-                        
-                        # Incrementar contador para vaciar el input de URL
-                        st.session_state.target_url_counter += 1
-                        
-                        get_pdfs.clear()
-                        get_targets.clear()
-                        import time
-                        time.sleep(1.5)
-                        st.rerun()
-                    elif res.status_code == 400:
-                        err_data = res.json()
-                        st.error(f"⚠️ {err_data.get('error', 'Error reportado por el backend.')}")
-                    else:
-                        st.error(f"Error en el backend: {res.status_code} - {res.text}")
-                except Exception as e:
-                    st.error(f"Error de conexión: {e}")
+            parsed = urlparse(target_url)
+            # Validar URL
+            if not parsed.scheme or not parsed.netloc:
+                st.error("⚠️ Error: La URL proporcionada no es válida. Asegúrate de incluir http:// o https://")
+            else:
+                with st.spinner(f"Analizando {target_url} con Playwright (esto puede tardar unos minutos)..."):
+                    try:
+                        res = requests.post(
+                            f"{backend_url}/run-scraper", 
+                            json={
+                                "url": target_url,
+                                "area_tag": selected_scrap_area,
+                                "empresa_tag": selected_scrap_emp
+                            }
+                        )
+                        if res.status_code == 200:
+                            data = res.json()
+                            st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
+                            
+                            # Incrementar contador para vaciar el input de URL
+                            st.session_state.target_url_counter += 1
+                            
+                            get_pdfs.clear()
+                            get_targets.clear()
+                            import time
+                            time.sleep(1.5)
+                            st.rerun()
+                        elif res.status_code == 400:
+                            err_data = res.json()
+                            st.error(f"⚠️ {err_data.get('error', 'Error reportado por el backend.')}")
+                        else:
+                            st.error(f"Error en el backend: {res.status_code} - {res.text}")
+                    except Exception as e:
+                        st.error(f"Error de conexión: {e}")
 
 with col2:
     st.subheader("🕸️ Webs Rastreadas Anteriormente")
