@@ -435,6 +435,122 @@ async def update_sp_metadata(list_item_id: str, area_tag: Optional[str], empresa
         print(err_msg, flush=True)
         return False, err_msg
 
+async def verify_and_fix_tags_for_target(target_url: str):
+    """
+    Post-scrape verification pass.
+    For every PDF in the DB that belongs to target_url and has taxonomy tags:
+      1. Reads the actual field values from SharePoint.
+      2. If the tags are missing or wrong, issues a corrective PATCH.
+      3. Updates tags_synced in the DB accordingly.
+    This runs as a background task after run_merlin_scraper completes.
+    """
+    print(f"[Verify] Iniciando verificación post-scrap de etiquetas para {target_url}", flush=True)
+    try:
+        token = await get_graph_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        async with httpx.AsyncClient() as client:
+            await _warm_sp_meta_cache(client, headers)
+            list_id = _SP_META_CACHE["list_id"]
+            if not list_id:
+                print("[Verify] No se pudo obtener list_id del caché. Abortando verificación.", flush=True)
+                return
+
+            area_hidden = _SP_META_CACHE["area_hidden"]
+            empresa_hidden = _SP_META_CACHE["empresa_hidden"]
+
+            async with AsyncSessionLocal() as session:
+                from sqlalchemy import or_
+                res = await session.execute(
+                    select(ScrapedPDF).filter(
+                        ScrapedPDF.parent_target_url == target_url,
+                        ScrapedPDF.list_item_id != None,
+                        or_(ScrapedPDF.area_tag != None, ScrapedPDF.empresa_tag != None)
+                    )
+                )
+                pdfs = res.scalars().all()
+
+                if not pdfs:
+                    print(f"[Verify] No hay PDFs con etiquetas para verificar en {target_url}", flush=True)
+                    return
+
+                print(f"[Verify] Verificando {len(pdfs)} archivos en SharePoint...", flush=True)
+                fixed = 0
+                already_ok = 0
+
+                for pdf in pdfs:
+                    try:
+                        # Read current field values from SharePoint
+                        fields_url = (
+                            f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+                            f"/lists/{list_id}/items/{pdf.list_item_id}/fields"
+                            f"?$select={area_hidden},{empresa_hidden}"
+                        )
+                        get_resp = await client.get(fields_url, headers=headers)
+                        if get_resp.status_code != 200:
+                            print(f"[Verify] No se pudo leer campos de {pdf.filename} (status={get_resp.status_code})", flush=True)
+                            continue
+
+                        current_fields = get_resp.json()
+                        current_area = current_fields.get(area_hidden, "") or ""
+                        current_empresa = current_fields.get(empresa_hidden, "") or ""
+
+                        # Build expected values
+                        expected_area = ""
+                        expected_empresa = ""
+                        if pdf.area_tag and "|" in pdf.area_tag:
+                            label, guid = pdf.area_tag.split("|")
+                            expected_area = f"-1;#{label}|{guid}"
+                        if pdf.empresa_tag and "|" in pdf.empresa_tag:
+                            label, guid = pdf.empresa_tag.split("|")
+                            expected_empresa = f"-1;#{label}|{guid}"
+
+                        # Compare — SharePoint stores taxonomy as "id;#Label|guid"
+                        # We check if expected guid appears anywhere in the stored value
+                        area_ok = (not expected_area) or (pdf.area_tag.split("|")[-1] in current_area)
+                        empresa_ok = (not expected_empresa) or (pdf.empresa_tag.split("|")[-1] in current_empresa)
+
+                        if area_ok and empresa_ok:
+                            already_ok += 1
+                            if not pdf.tags_synced:
+                                pdf.tags_synced = 1
+                            continue
+
+                        # Tags are missing or wrong — patch them
+                        print(f"[Verify] Corrigiendo etiquetas de {pdf.filename} "
+                              f"(area_ok={area_ok}, empresa_ok={empresa_ok})", flush=True)
+                        payload = {}
+                        if expected_area:
+                            payload[area_hidden] = expected_area
+                        if expected_empresa:
+                            payload[empresa_hidden] = expected_empresa
+
+                        patch_resp = await client.patch(
+                            f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+                            f"/lists/{list_id}/items/{pdf.list_item_id}/fields",
+                            json=payload, headers=headers
+                        )
+                        if patch_resp.status_code == 200:
+                            pdf.tags_synced = 1
+                            fixed += 1
+                            print(f"[Verify] ✓ Etiquetas corregidas para {pdf.filename}", flush=True)
+                        else:
+                            print(f"[Verify] ✗ Fallo al corregir {pdf.filename}: "
+                                  f"{patch_resp.status_code} {patch_resp.text[:200]}", flush=True)
+
+                    except Exception as e:
+                        print(f"[Verify] Error procesando {pdf.filename}: {e}", flush=True)
+
+                await session.commit()
+                sync_db_to_sp()
+                print(f"[Verify] Verificación completada. Correctos: {already_ok}, Corregidos: {fixed}", flush=True)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[Verify] Error general en verificación: {e}", flush=True)
+
+
 # --- Scraper Logic ---
 
 async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, empresa_tag: Optional[str] = None) -> dict:
@@ -743,6 +859,8 @@ async def serve_pdf(filename: str):
 async def api_run_scraper(req: ScrapeRequest):
     try:
         result = await run_merlin_scraper(req.url, req.area_tag, req.empresa_tag)
+        # Launch post-scrape tag verification as a background task (non-blocking)
+        asyncio.create_task(verify_and_fix_tags_for_target(req.url))
         return result
     except Exception as e:
         return JSONResponse(status_code=400, content={'error': str(e)})
@@ -759,6 +877,7 @@ async def api_run_scraper_all():
         res = await run_merlin_scraper(url)
         total_downloaded += res["downloaded_count"]
         skipped += res["skipped_count"]
+        asyncio.create_task(verify_and_fix_tags_for_target(url))
     return {"message": "Completado", "downloaded": total_downloaded, "skipped": skipped}
 
 @app.get("/api/pdfs", response_model=List[PDFResponse])
