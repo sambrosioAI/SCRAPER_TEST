@@ -123,7 +123,9 @@ async def upload_to_sp(filename: str, content: bytes, folder_path: str) -> tuple
             print(f"Archivo {filename} subido con éxito. DriveItem: {drive_item_id}, ListItem: {list_item_id}")
             return drive_item_id, list_item_id
     except Exception as e:
-        print(f"Error subiendo {filename} a SharePoint: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"Error subiendo {filename} a SharePoint: {e}", flush=True)
         return None, None
 
 def sync_db_to_sp():
@@ -163,6 +165,56 @@ class ScrapedTarget(Base):
     target_url = Column(String, unique=True, index=True, nullable=False)
     last_scraped_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     total_pdfs_found = Column(Integer, default=0)
+
+async def sync_missing_metadata():
+    print("[Sync] Iniciando sincronización de metadatos faltantes en SharePoint...", flush=True)
+    async with AsyncSessionLocal() as session:
+        try:
+            result = await session.execute(
+                select(ScrapedPDF).filter(
+                    (ScrapedPDF.list_item_id == None) | (ScrapedPDF.drive_item_id == None)
+                )
+            )
+            pdf_items = result.scalars().all()
+            if not pdf_items:
+                print("[Sync] No hay PDFs sin list_item_id/drive_item_id.", flush=True)
+                return
+
+            print(f"[Sync] Encontrados {len(pdf_items)} PDFs para resolver e indexar.", flush=True)
+            token = await get_graph_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient() as client:
+                _, drive_id = await get_sp_identifiers(client, headers)
+                
+                updated_any = False
+                for pdf in pdf_items:
+                    print(f"[Sync] Resolviendo {pdf.filename}...", flush=True)
+                    path_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/data/pdfs/{pdf.filename}"
+                    params = {"$expand": "listItem"}
+                    resp = await client.get(path_url, headers=headers, params=params)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        pdf.drive_item_id = data.get("id")
+                        pdf.list_item_id = data.get("listItem", {}).get("id")
+                        print(f"[Sync] Resolvido: DriveItem={pdf.drive_item_id}, ListItem={pdf.list_item_id}", flush=True)
+                        
+                        # Si tiene etiquetas, actualizarlas en SharePoint
+                        if pdf.list_item_id and (pdf.area_tag or pdf.empresa_tag):
+                            success, err = await update_sp_metadata(pdf.list_item_id, pdf.area_tag, pdf.empresa_tag)
+                            if success:
+                                print(f"[Sync] Etiquetas actualizadas en SharePoint para {pdf.filename}", flush=True)
+                            else:
+                                print(f"[Sync] Error actualizando etiquetas en SharePoint para {pdf.filename}: {err}", flush=True)
+                        updated_any = True
+                    else:
+                        print(f"[Sync] No se pudo resolver {pdf.filename} por ruta (status={resp.status_code}): {resp.text[:200]}", flush=True)
+                
+                if updated_any:
+                    await session.commit()
+                    sync_db_to_sp()
+                    print("[Sync] Sincronización completada y base de datos guardada en SharePoint.", flush=True)
+        except Exception as e:
+            print(f"[Sync] Error durante la sincronización: {e}", flush=True)
 
 # Create tables if not exist
 @app.on_event("startup")
@@ -204,6 +256,9 @@ async def startup():
                     await conn.execute(text(f"ALTER TABLE scraped_pdfs ADD COLUMN {col_name} {col_type};"))
         except Exception as e:
             print(f"Error ejecutando migración: {e}", flush=True)
+            
+    # Lanzar la tarea de sincronización de metadatos en segundo plano
+    asyncio.create_task(sync_missing_metadata())
 
 # --- Pydantic Schemas ---
 

@@ -14,6 +14,18 @@ for key_init in ["pdf_select_counter", "new_emp_counter", "scrap_new_emp_counter
 # -- CSS Personalizado --
 st.markdown("""
 <style>
+    .block-container {
+        padding-top: 1.5rem !important;
+        padding-bottom: 1rem !important;
+        max-width: 95% !important;
+    }
+    [data-testid="stHeader"] {
+        height: 0px !important;
+        min-height: 0px !important;
+        padding: 0px !important;
+        margin: 0px !important;
+        display: none !important;
+    }
     .stButton>button {
         background-color: #2e6b4c;
         color: white;
