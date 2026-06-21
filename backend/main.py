@@ -348,6 +348,7 @@ class ScrapeResult(BaseModel):
     message: str
     downloaded_count: int
     skipped_count: int
+    failed_files: list = []  # Files that could not be uploaded after all retries
     
 class PDFResponse(BaseModel):
     id: int
@@ -638,6 +639,7 @@ async def verify_and_fix_tags_for_target(target_url: str):
 async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, empresa_tag: Optional[str] = None) -> dict:
     downloaded = 0
     skipped = 0
+    failed_files: list = []  # Tracks files that failed after all retries
     
     # 1. Validación Directa: Si es un PDF suelto, evitamos Playwright
     if target_url.lower().strip().endswith(".pdf"):
@@ -650,71 +652,97 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                 try:
                     filename = target_url.split("/")[-1].split("?")[0]
                     if not filename.lower().endswith(".pdf"):
-                        filename = "document_direct.pdf"
-                    
-                    # Prevent filename collisions: Skip if filename already exists in DB
+                     # Prevent filename collisions: Skip if filename already exists in DB
                     async with AsyncSessionLocal() as session_check:
                         name_check = await session_check.execute(select(ScrapedPDF).filter(ScrapedPDF.filename == filename))
                         if name_check.scalars().first():
                             print(f"Omitiendo {filename}: ya existe un archivo con este nombre.")
                             skipped += 1
                         else:
-                            headers = {
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                "Referer": target_url,
-                            }
-                            async with httpx.AsyncClient(verify=False) as client:
-                                req = await client.get(target_url, headers=headers, timeout=60.0)
-                                req.raise_for_status()
-                                file_content = req.content
+                            MAX_ATTEMPTS = 3
+                            file_failed = False
+                            last_error = ""
+                            
+                            for attempt in range(1, MAX_ATTEMPTS + 1):
+                                try:
+                                    headers = {
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                        "Referer": target_url,
+                                    }
+                                    dl_timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+                                    async with httpx.AsyncClient(verify=False, timeout=dl_timeout) as client:
+                                        req = await client.get(target_url, headers=headers)
+                                        req.raise_for_status()
+                                        file_content = req.content
+                                            
+                                    size_bytes = len(file_content)
                                     
-                            size_bytes = len(file_content)
-                            
-                            # Subir a SharePoint via Graph REST
-                            drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
-                            
-                            # Apply tags and track whether the PATCH succeeded
-                            tags_synced_flag = 0
-                            if list_item_id and (area_tag or empresa_tag):
-                                tag_ok, _ = await update_sp_metadata(list_item_id, area_tag, empresa_tag)
-                                tags_synced_flag = 1 if tag_ok else 0
-                            elif not (area_tag or empresa_tag):
-                                tags_synced_flag = 1  # nothing to tag
-
-                            new_pdf = ScrapedPDF(
-                                filename=filename, 
-                                source_url=target_url, 
-                                size_bytes=size_bytes,
-                                parent_target_url=target_url,
-                                drive_item_id=drive_item_id,
-                                list_item_id=list_item_id,
-                                area_tag=area_tag,
-                                empresa_tag=empresa_tag,
-                                tags_synced=tags_synced_flag
-                            )
-                            session.add(new_pdf)
-                            await session.commit()
-                            downloaded += 1
-                except Exception as e:
-                    if "UNIQUE constraint failed" in str(e):
-                        await session.rollback()
-                        print("Conflicto de integridad en descarga directa evitado.")
-                        skipped += 1
-                    else:
-                        raise Exception(f"Falla en descarga directa: {str(e)}")
-                    
-            # Upsert Target
-            result_target = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.target_url == target_url))
-            existing_target = result_target.scalars().first()
-            if existing_target:
-                existing_target.last_scraped_date = datetime.utcnow()
-                existing_target.total_pdfs_found += downloaded
-            else:
-                session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=downloaded))
-            await session.commit()
-            
-        sync_db_to_sp()
-        return {"downloaded_count": downloaded, "skipped_count": skipped, "message": "Direct PDF download complete"}
+                                    # Subir a SharePoint via Graph REST
+                                    drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
+                                    if not drive_item_id:
+                                        raise Exception(f"upload_to_sp devolvió None para {filename}")
+                                    
+                                    # Apply tags and track whether the PATCH succeeded
+                                    tags_synced_flag = 0
+                                    if list_item_id and (area_tag or empresa_tag):
+                                        tag_ok, _ = await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+                                        tags_synced_flag = 1 if tag_ok else 0
+                                    elif not (area_tag or empresa_tag):
+                                        tags_synced_flag = 1  # nothing to tag
+         
+                                    new_pdf = ScrapedPDF(
+                                        filename=filename, 
+                                        source_url=target_url, 
+                                        size_bytes=size_bytes,
+                                        parent_target_url=target_url,
+                                        drive_item_id=drive_item_id,
+                                        list_item_id=list_item_id,
+                                        area_tag=area_tag,
+                                        empresa_tag=empresa_tag,
+                                        tags_synced=tags_synced_flag
+                                    )
+                                    session.add(new_pdf)
+                                    await session.commit()
+                                    downloaded += 1
+                                    file_failed = False
+                                    print(f"[OK Direct PDF] {filename} guardado correctamente en SP.", flush=True)
+                                    break
+                                except Exception as e:
+                                    last_error = str(e)
+                                    if "UNIQUE constraint failed" in last_error:
+                                        await session.rollback()
+                                        print("Conflicto de integridad en descarga directa evitado.")
+                                        skipped += 1
+                                        file_failed = False
+                                        break
+                                    print(f"[Direct PDF Intento {attempt}/{MAX_ATTEMPTS}] Error: {last_error}", flush=True)
+                                    if attempt < MAX_ATTEMPTS:
+                                        wait = attempt * 5
+                                        await asyncio.sleep(wait)
+                                    else:
+                                        file_failed = True
+                                        
+                            if file_failed:
+                                failed_files.append(filename)
+                                print(f"[FALLO DEFINITIVO Direct PDF] {filename} no pudo guardarse tras {MAX_ATTEMPTS} intentos: {last_error}", flush=True)
+                     
+             # Upsert Target
+             result_target = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.target_url == target_url))
+             existing_target = result_target.scalars().first()
+             if existing_target:
+                 existing_target.last_scraped_date = datetime.utcnow()
+                 existing_target.total_pdfs_found += downloaded
+             else:
+                 session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=downloaded))
+             await session.commit()
+             
+         sync_db_to_sp()
+         return {
+             "downloaded_count": downloaded,
+             "skipped_count": skipped,
+             "message": "Direct PDF download complete",
+             "failed_files": failed_files
+         }
 
     
     # Lógica con Playwright
@@ -848,53 +876,77 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                     skipped += 1
                     continue
 
-                try:
-                    p_cookies = await context.cookies()
-                    cookies_dict = {c['name']: c['value'] for c in p_cookies}
-                    
-                    headers = {
-                        "User-Agent": fake_user_agent,
-                        "Referer": target_url,
-                        "Accept": "application/pdf,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
-                    }
-                    
-                    async with httpx.AsyncClient(cookies=cookies_dict, verify=False) as client:
-                        req = await client.get(pdf_url, headers=headers, timeout=60.0)
-                        req.raise_for_status()
-                        file_content = req.content
-                    
-                    drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
-                    
-                    # Apply tags and track whether the PATCH succeeded
-                    tags_synced_flag = 0
-                    if list_item_id and (area_tag or empresa_tag):
-                        tag_ok, _ = await update_sp_metadata(list_item_id, area_tag, empresa_tag)
-                        tags_synced_flag = 1 if tag_ok else 0
-                    elif not (area_tag or empresa_tag):
-                        tags_synced_flag = 1  # nothing to tag, considered done
+                MAX_ATTEMPTS = 3
+                file_failed = False
+                last_error = ""
 
-                    session.add(ScrapedPDF(
-                        filename=filename, 
-                        source_url=pdf_url, 
-                        size_bytes=len(file_content), 
-                        parent_target_url=target_url,
-                        drive_item_id=drive_item_id,
-                        list_item_id=list_item_id,
-                        area_tag=area_tag,
-                        empresa_tag=empresa_tag,
-                        tags_synced=tags_synced_flag
-                    ))
-                    await session.commit()
-                    downloaded += 1
-                except Exception as e:
-                    # Catch integrity errors if filename unique constraint is hit
-                    if "UNIQUE constraint failed" in str(e):
-                        await session.rollback() # Crucial: Reset session state after integrity failure
-                        print(f"Conflicto de integridad evitado para {filename}: ya existe.")
-                        skipped += 1
-                    else:
-                        print(f"Error downloading {pdf_url}: {e}")
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    try:
+                        p_cookies = await context.cookies()
+                        cookies_dict = {c['name']: c['value'] for c in p_cookies}
+                        
+                        dl_headers = {
+                            "User-Agent": fake_user_agent,
+                            "Referer": target_url,
+                            "Accept": "application/pdf,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+                        }
+                        dl_timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+                        async with httpx.AsyncClient(cookies=cookies_dict, verify=False, timeout=dl_timeout) as dl_client:
+                            req = await dl_client.get(pdf_url, headers=dl_headers)
+                            req.raise_for_status()
+                            file_content = req.content
+                        
+                        print(f"[Intento {attempt}/{MAX_ATTEMPTS}] Descargado {filename} ({len(file_content)//1024} KB). Subiendo a SP...", flush=True)
+                        drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
+                        
+                        if not drive_item_id:
+                            raise Exception(f"upload_to_sp devolvió None para {filename}")
+                        
+                        # Apply tags and track result
+                        tags_synced_flag = 0
+                        if list_item_id and (area_tag or empresa_tag):
+                            tag_ok, _ = await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+                            tags_synced_flag = 1 if tag_ok else 0
+                        elif not (area_tag or empresa_tag):
+                            tags_synced_flag = 1
+
+                        session.add(ScrapedPDF(
+                            filename=filename,
+                            source_url=pdf_url,
+                            size_bytes=len(file_content),
+                            parent_target_url=target_url,
+                            drive_item_id=drive_item_id,
+                            list_item_id=list_item_id,
+                            area_tag=area_tag,
+                            empresa_tag=empresa_tag,
+                            tags_synced=tags_synced_flag
+                        ))
+                        await session.commit()
+                        downloaded += 1
+                        file_failed = False
+                        print(f"[OK] {filename} guardado correctamente en SP (intento {attempt}).", flush=True)
+                        break  # Success — stop retrying
+
+                    except Exception as e:
+                        last_error = str(e)
+                        if "UNIQUE constraint failed" in last_error:
+                            await session.rollback()
+                            print(f"Duplicado ignorado: {filename}")
+                            skipped += 1
+                            file_failed = False
+                            break
+                        print(f"[Intento {attempt}/{MAX_ATTEMPTS}] Error en {filename}: {last_error}", flush=True)
+                        if attempt < MAX_ATTEMPTS:
+                            wait = attempt * 5
+                            print(f"Reintentando en {wait}s...", flush=True)
+                            await asyncio.sleep(wait)
+                        else:
+                            file_failed = True
+
+                if file_failed:
+                    failed_files.append(filename)
+                    print(f"[FALLO DEFINITIVO] {filename} no pudo guardarse tras {MAX_ATTEMPTS} intentos: {last_error}", flush=True)
             
             # Final Update: Recalculate total unique PDFs for this target from DB
             count_stmt = select(text("count(*)")).select_from(text("scraped_pdfs")).where(text(f"parent_target_url=:turl"))
@@ -914,7 +966,12 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
         await browser.close()
     
     sync_db_to_sp()
-    return {"downloaded_count": downloaded, "skipped_count": (len(target_pdfs) - downloaded), "message": "Scraping complete"}
+    return {
+        "downloaded_count": downloaded,
+        "skipped_count": (len(target_pdfs) - downloaded - len(failed_files)),
+        "message": "Scraping complete",
+        "failed_files": failed_files
+    }
 
 # --- Endpoints ---
 
@@ -1125,3 +1182,4 @@ async def tag_pdf(pdf_id: int, req: TagPDFRequest):
             "sp_updated": sp_error is None,
             "sp_error": sp_error
         }
+

@@ -11,6 +11,9 @@ for key_init in ["pdf_select_counter", "new_emp_counter", "scrap_new_emp_counter
     if key_init not in st.session_state:
         st.session_state[key_init] = 0
 
+if "last_scraping_result" not in st.session_state:
+    st.session_state["last_scraping_result"] = None
+
 # -- CSS Personalizado --
 st.markdown("""
 <style>
@@ -73,6 +76,18 @@ col1, col2 = st.columns([1, 1])
 with col1:
     st.subheader("🌐 Añadir nueva url de rastreo")
     
+    if st.session_state.get("last_scraping_result"):
+        res_data = st.session_state["last_scraping_result"]
+        if res_data.get("failed_files"):
+            st.error(f"⚠️ **Atención:** Los siguientes archivos se descargaron pero NO se pudieron guardar/etiquetar correctamente en SharePoint tras varios intentos:\n\n" + "\n".join([f"- `{f}`" for f in res_data["failed_files"]]))
+            st.info("El sistema reintentará sincronizarlos automáticamente en segundo plano o al reiniciar.")
+        else:
+            st.success(f"✅ ¡Scraping completado con éxito! Descargados: **{res_data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{res_data['skipped_count']}**")
+        
+        if st.button("Limpiar aviso", key="clear_scrap_notice_btn"):
+            st.session_state["last_scraping_result"] = None
+            st.rerun()
+            
     # Cargar términos de taxonomía del backend para el formulario de scraping
     areas_scrap = []
     empresas_scrap = []
@@ -167,7 +182,7 @@ with col1:
                         )
                         if res.status_code == 200:
                             data = res.json()
-                            st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
+                            st.session_state["last_scraping_result"] = data
                             
                             # Incrementar contador para vaciar el input de URL y resetear selectores de forma segura
                             st.session_state.target_url_counter += 1
@@ -176,8 +191,6 @@ with col1:
                             
                             get_pdfs.clear()
                             get_targets.clear()
-                            import time
-                            time.sleep(1.5)
                             st.rerun()
                         elif res.status_code == 400:
                             err_data = res.json()
