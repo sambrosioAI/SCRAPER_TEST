@@ -169,8 +169,10 @@ with col1:
                             data = res.json()
                             st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
                             
-                            # Incrementar contador para vaciar el input de URL
+                            # Incrementar contador para vaciar el input de URL y resetear selectores
                             st.session_state.target_url_counter += 1
+                            st.session_state.scrap_area_widget = "-- Sin Asignar --"
+                            st.session_state.scrap_empresa_widget = "-- Sin Asignar --"
                             
                             get_pdfs.clear()
                             get_targets.clear()

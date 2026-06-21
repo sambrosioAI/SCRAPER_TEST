@@ -113,12 +113,17 @@ async def upload_to_sp(filename: str, content: bytes, folder_path: str) -> tuple
             drive_item = put_resp.json()
             drive_item_id = drive_item.get("id")
             
-            # Resolve the listItem ID
+            # Resolve the listItem ID with retries to handle SharePoint indexing delay
             li_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{drive_item_id}/listItem"
-            li_resp = await client.get(li_url, headers=headers)
             list_item_id = None
-            if li_resp.status_code == 200:
-                list_item_id = li_resp.json().get("id")
+            for attempt in range(5):
+                li_resp = await client.get(li_url, headers=headers)
+                if li_resp.status_code == 200:
+                    list_item_id = li_resp.json().get("id")
+                    break
+                else:
+                    print(f"Intento {attempt+1} para obtener listItem de {filename} falló (status {li_resp.status_code}). Reintentando en 1s...", flush=True)
+                    await asyncio.sleep(1)
                 
             print(f"Archivo {filename} subido con éxito. DriveItem: {drive_item_id}, ListItem: {list_item_id}")
             return drive_item_id, list_item_id
