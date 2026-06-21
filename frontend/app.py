@@ -4,7 +4,12 @@ import os
 import pandas as pd
 from urllib.parse import urlparse
 
-st.set_page_config(page_title="Scraper Financiero", layout="wide")
+st.set_page_config(page_title="Scraper Universal", layout="wide")
+
+# Initialize session state keys for widget resets
+for key_init in ["pdf_select_counter", "new_emp_counter", "scrap_new_emp_counter", "target_url_counter"]:
+    if key_init not in st.session_state:
+        st.session_state[key_init] = 0
 
 # -- CSS Personalizado --
 st.markdown("""
@@ -56,31 +61,114 @@ col1, col2 = st.columns([1, 1])
 with col1:
     st.subheader("🌐 Añadir nueva url de rastreo")
     
-    with st.form("scraper_form", clear_on_submit=True):
-        target_url = st.text_input("URL Objetivo para el Scraper", value="", placeholder="Introduce la dirección web...")
-        submitted = st.form_submit_button("🔍 Iniciar Scraping", type="primary")
+    # Cargar términos de taxonomía del backend para el formulario de scraping
+    areas_scrap = []
+    empresas_scrap = []
+    try:
+        r_area = requests.get(f"{backend_url}/api/taxonomy/area/terms")
+        if r_area.status_code == 200:
+            areas_scrap = r_area.json()
+    except:
+        pass
         
-        if submitted:
-            parsed = urlparse(target_url)
-            # Validar URL
-            if not target_url.strip() or not parsed.scheme or not parsed.netloc:
-                st.error("⚠️ Error: La URL proporcionada no es válida. Asegúrate de incluir http:// o https://")
+    try:
+        r_emp = requests.get(f"{backend_url}/api/taxonomy/empresa/terms")
+        if r_emp.status_code == 200:
+            empresas_scrap = r_emp.json()
+    except:
+        pass
+
+    st.write("**Área Solicitante (para nuevos documentos)**")
+    area_scrap_options = ["-- Sin Asignar --"] + [f"{a['label']}|{a['id']}" for a in areas_scrap]
+    selected_scrap_area = st.selectbox(
+        "Selecciona el Área para el Scrap:",
+        options=area_scrap_options,
+        format_func=lambda x: x.split("|")[0] if "|" in x else x,
+        key="scrap_area_widget"
+    )
+    
+    st.write("**Empresa Estudiada (para nuevos documentos)**")
+    emp_scrap_options = ["-- Sin Asignar --"] + [f"{e['label']}|{e['id']}" for e in empresas_scrap]
+    selected_scrap_emp = st.selectbox(
+        "Selecciona la Empresa para el Scrap:",
+        options=emp_scrap_options,
+        format_func=lambda x: x.split("|")[0] if "|" in x else x,
+        key="scrap_empresa_widget"
+    )
+    
+    # Formulario para crear una nueva etiqueta de Empresa en la parte de Scraping
+    with st.expander("➕ Crear nueva etiqueta de Empresa"):
+        new_scrap_emp_name = st.text_input("Nombre de la nueva empresa:", key=f"scrap_new_emp_name_input_{st.session_state.scrap_new_emp_counter}")
+        if st.button("Crear Término", key="scrap_create_term_btn_widget"):
+            if not new_scrap_emp_name.strip():
+                st.error("Por favor, introduce un nombre válido.")
             else:
-                with st.spinner(f"Analizando {target_url} con Playwright (esto puede tardar unos minutos)..."):
+                with st.spinner("Creando término en SharePoint..."):
                     try:
-                        res = requests.post(f"{backend_url}/run-scraper", json={"url": target_url})
-                        if res.status_code == 200:
-                            data = res.json()
-                            st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
-                            get_pdfs.clear()
-                            get_targets.clear()
-                        elif res.status_code == 400:
-                            err_data = res.json()
-                            st.error(f"⚠️ {err_data.get('error', 'Error reportado por el backend.')}")
+                        res_new_term = requests.post(f"{backend_url}/api/taxonomy/empresa/terms", json={"name": new_scrap_emp_name.strip()})
+                        if res_new_term.status_code == 200:
+                            st.success(f"Empresa '{new_scrap_emp_name}' creada con éxito en el TermStore.")
+                            st.session_state.scrap_new_emp_counter += 1  # Increment counter to clear text input
+                            st.cache_data.clear()
+                            st.rerun()
                         else:
-                            st.error(f"Error en el backend: {res.status_code} - {res.text}")
-                    except Exception as e:
-                        st.error(f"Error de conexión: {e}")
+                            st.error(f"Error creando término: {res_new_term.text}")
+                    except Exception as ex:
+                        st.error(f"Excepción: {ex}")
+
+    target_url = st.text_input("URL Objetivo para el Scraper", value="", placeholder="Introduce la dirección web...", key=f"scrap_target_url_input_{st.session_state.target_url_counter}")
+    
+    is_area_assigned = (selected_scrap_area != "-- Sin Asignar --")
+    is_empresa_assigned = (selected_scrap_emp != "-- Sin Asignar --")
+    is_url_provided = bool(target_url.strip())
+    
+    # Mostrar avisos dinámicos si falta alguna de las etiquetas
+    if not is_area_assigned:
+        st.warning("⚠️ Debes seleccionar un **Área Solicitante** para poder iniciar el scraping.")
+    if not is_empresa_assigned:
+        st.warning("⚠️ Debes seleccionar una **Empresa Estudiada** para poder iniciar el scraping.")
+    if not is_url_provided:
+        st.info("💡 Introduce la URL de destino arriba para comenzar.")
+        
+    button_enabled = is_area_assigned and is_empresa_assigned and is_url_provided
+    
+    submitted = st.button("🔍 Iniciar Scraping", type="primary", disabled=not button_enabled, key="run_scraping_btn_widget")
+    
+    if submitted:
+        parsed = urlparse(target_url)
+        # Validar URL
+        if not parsed.scheme or not parsed.netloc:
+            st.error("⚠️ Error: La URL proporcionada no es válida. Asegúrate de incluir http:// o https://")
+        else:
+            with st.spinner(f"Analizando {target_url} con Playwright (esto puede tardar unos minutos)..."):
+                try:
+                    res = requests.post(
+                        f"{backend_url}/run-scraper", 
+                        json={
+                            "url": target_url,
+                            "area_tag": selected_scrap_area,
+                            "empresa_tag": selected_scrap_emp
+                        }
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
+                        
+                        # Incrementar contador para vaciar el input de URL
+                        st.session_state.target_url_counter += 1
+                        
+                        get_pdfs.clear()
+                        get_targets.clear()
+                        import time
+                        time.sleep(1.5)
+                        st.rerun()
+                    elif res.status_code == 400:
+                        err_data = res.json()
+                        st.error(f"⚠️ {err_data.get('error', 'Error reportado por el backend.')}")
+                    else:
+                        st.error(f"Error en el backend: {res.status_code} - {res.text}")
+                except Exception as e:
+                    st.error(f"Error de conexión: {e}")
 
 with col2:
     st.subheader("🕸️ Webs Rastreadas Anteriormente")
@@ -190,7 +278,11 @@ else:
     
     # Selector de documento
     pdf_names = [p["filename"] for p in pdfs]
-    selected_filename = st.selectbox("Selecciona un PDF de la lista para editar etiquetas:", ["-- Selecciona un archivo --"] + pdf_names)
+    selected_filename = st.selectbox(
+        "Selecciona un PDF de la lista para editar etiquetas:", 
+        ["-- Selecciona un archivo --"] + pdf_names, 
+        key=f"selected_pdf_selectbox_{st.session_state.pdf_select_counter}"
+    )
     
     if selected_filename != "-- Selecciona un archivo --":
         # Encontrar el elemento PDF correspondiente
@@ -261,7 +353,7 @@ else:
             
             # Formulario para crear una nueva etiqueta de Empresa
             with st.expander("➕ Crear nueva etiqueta de Empresa"):
-                new_emp_name = st.text_input("Nombre de la nueva empresa:", key="new_emp_name_input")
+                new_emp_name = st.text_input("Nombre de la nueva empresa:", key=f"new_emp_name_input_{st.session_state.new_emp_counter}")
                 if st.button("Crear Término", key="create_term_btn_widget"):
                     if not new_emp_name.strip():
                         st.error("Por favor, introduce un nombre válido.")
@@ -271,6 +363,7 @@ else:
                                 res_new_term = requests.post(f"{backend_url}/api/taxonomy/empresa/terms", json={"name": new_emp_name.strip()})
                                 if res_new_term.status_code == 200:
                                     st.success(f"Empresa '{new_emp_name}' creada con éxito en el TermStore.")
+                                    st.session_state.new_emp_counter += 1  # Increment counter to clear text input
                                     st.cache_data.clear()
                                     st.rerun()
                                 else:
@@ -293,6 +386,8 @@ else:
                         save_data = res_save.json()
                         if save_data.get("sp_updated"):
                             st.success("¡Etiquetas guardadas con éxito en Base de Datos y en SharePoint!")
+                            # Incrementar contador para volver a poner el selector a "-- Selecciona un archivo --"
+                            st.session_state.pdf_select_counter += 1
                         else:
                             st.warning(f"Etiquetas guardadas localmente. Nota: {save_data.get('sp_error')}")
                         st.cache_data.clear()

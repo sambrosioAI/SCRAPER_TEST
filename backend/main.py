@@ -209,6 +209,8 @@ async def startup():
 
 class ScrapeRequest(BaseModel):
     url: str
+    area_tag: Optional[str] = None
+    empresa_tag: Optional[str] = None
 
 class ScrapeResult(BaseModel):
     message: str
@@ -238,9 +240,73 @@ class TargetResponse(BaseModel):
     class Config:
         from_attributes = True
 
+async def update_sp_metadata(list_item_id: str, area_tag: Optional[str], empresa_tag: Optional[str]) -> tuple:
+    """
+    Updates the hidden taxonomy fields in SharePoint for a given list_item_id.
+    Returns (success: bool, error: Optional[str])
+    """
+    if not list_item_id:
+        return False, "No list_item_id provided"
+    
+    try:
+        token = await get_graph_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        async with httpx.AsyncClient() as client:
+            _, drive_id = await get_sp_identifiers(client, headers)
+            
+            list_info_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
+            list_resp = await client.get(list_info_url, headers=headers)
+            if list_resp.status_code == 200:
+                list_id = list_resp.json().get("id")
+                
+                # Resolver columnas ocultas dinámicamente
+                area_hidden = "b7fd4b1dee4d4886a868470f8808f500"  # fallback
+                empresa_hidden = "n11a72e1dda14adca329b2b677e5c9a8"  # fallback
+                
+                cols_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/columns"
+                cols_params = {"$select": "name,displayName,hidden"}
+                cols_resp = await client.get(cols_url, headers=headers, params=cols_params)
+                if cols_resp.status_code == 200:
+                    cols_list = cols_resp.json().get("value", [])
+                    for col in cols_list:
+                        disp = col.get("displayName", "")
+                        name = col.get("name", "")
+                        if col.get("hidden") and disp == "Area solicitante_0":
+                            area_hidden = name
+                        elif col.get("hidden") and disp == "Empresa estudiada_0":
+                            empresa_hidden = name
+                            
+                # Preparar el payload con las columnas ocultas correctas
+                payload = {}
+                if area_tag and "|" in area_tag:
+                    label, guid = area_tag.split("|")
+                    payload[area_hidden] = f"-1;#{label}|{guid}"
+                if empresa_tag and "|" in empresa_tag:
+                    label, guid = empresa_tag.split("|")
+                    payload[empresa_hidden] = f"-1;#{label}|{guid}"
+                    
+                if payload:
+                    fields_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items/{list_item_id}/fields"
+                    patch_resp = await client.patch(fields_url, json=payload, headers=headers)
+                    if patch_resp.status_code == 200:
+                        print(f"Etiquetas de SharePoint actualizadas con éxito vía Graph (campos ocultos).", flush=True)
+                        return True, None
+                    else:
+                        err_msg = f"Graph returned status {patch_resp.status_code}: {patch_resp.text}"
+                        print(f"Graph update failed for hidden fields: {err_msg}", flush=True)
+                        return False, err_msg
+                else:
+                    return True, None
+            return False, "Failed to resolve list_id"
+    except Exception as e:
+        err_msg = f"SharePoint Update Exception: {e}"
+        print(err_msg, flush=True)
+        return False, err_msg
+
 # --- Scraper Logic ---
 
-async def run_merlin_scraper(target_url: str) -> dict:
+async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, empresa_tag: Optional[str] = None) -> dict:
     downloaded = 0
     skipped = 0
     
@@ -278,13 +344,19 @@ async def run_merlin_scraper(target_url: str) -> dict:
                             # Subir a SharePoint via Graph REST
                             drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
                             
+                            # If tags are provided, update them in SharePoint immediately
+                            if list_item_id and (area_tag or empresa_tag):
+                                await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+
                             new_pdf = ScrapedPDF(
                                 filename=filename, 
                                 source_url=target_url, 
                                 size_bytes=size_bytes,
                                 parent_target_url=target_url,
                                 drive_item_id=drive_item_id,
-                                list_item_id=list_item_id
+                                list_item_id=list_item_id,
+                                area_tag=area_tag,
+                                empresa_tag=empresa_tag
                             )
                             session.add(new_pdf)
                             await session.commit()
@@ -459,13 +531,20 @@ async def run_merlin_scraper(target_url: str) -> dict:
                         file_content = req.content
                     
                     drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
+                    
+                    # If tags are provided, update them in SharePoint immediately
+                    if list_item_id and (area_tag or empresa_tag):
+                        await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+
                     session.add(ScrapedPDF(
                         filename=filename, 
                         source_url=pdf_url, 
                         size_bytes=len(file_content), 
                         parent_target_url=target_url,
                         drive_item_id=drive_item_id,
-                        list_item_id=list_item_id
+                        list_item_id=list_item_id,
+                        area_tag=area_tag,
+                        empresa_tag=empresa_tag
                     ))
                     await session.commit()
                     downloaded += 1
@@ -522,7 +601,7 @@ async def serve_pdf(filename: str):
 @app.post("/run-scraper", response_model=ScrapeResult)
 async def api_run_scraper(req: ScrapeRequest):
     try:
-        result = await run_merlin_scraper(req.url)
+        result = await run_merlin_scraper(req.url, req.area_tag, req.empresa_tag)
         return result
     except Exception as e:
         return JSONResponse(status_code=400, content={'error': str(e)})
@@ -694,55 +773,9 @@ async def tag_pdf(pdf_id: int, req: TagPDFRequest):
                 print(f"Error resolving list_item_id dynamically by path: {e}", flush=True)
 
         if pdf.list_item_id:
-            try:
-                token = await get_graph_token()
-                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                
-                async with httpx.AsyncClient() as client:
-                    _, drive_id = await get_sp_identifiers(client, headers)
-                    
-                    list_info_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
-                    list_resp = await client.get(list_info_url, headers=headers)
-                    if list_resp.status_code == 200:
-                        list_id = list_resp.json().get("id")
-                        
-                        # Resolver columnas ocultas dinámicamente
-                        area_hidden = "b7fd4b1dee4d4886a868470f8808f500"  # fallback
-                        empresa_hidden = "n11a72e1dda14adca329b2b677e5c9a8"  # fallback
-                        
-                        cols_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/columns"
-                        cols_params = {"$select": "name,displayName,hidden"}
-                        cols_resp = await client.get(cols_url, headers=headers, params=cols_params)
-                        if cols_resp.status_code == 200:
-                            cols_list = cols_resp.json().get("value", [])
-                            for col in cols_list:
-                                disp = col.get("displayName", "")
-                                name = col.get("name", "")
-                                if col.get("hidden") and disp == "Area solicitante_0":
-                                    area_hidden = name
-                                elif col.get("hidden") and disp == "Empresa estudiada_0":
-                                    empresa_hidden = name
-                                    
-                        # Preparar el payload con las columnas ocultas correctas
-                        payload = {}
-                        if req.area_tag and "|" in req.area_tag:
-                            label, guid = req.area_tag.split("|")
-                            payload[area_hidden] = f"-1;#{label}|{guid}"
-                        if req.empresa_tag and "|" in req.empresa_tag:
-                            label, guid = req.empresa_tag.split("|")
-                            payload[empresa_hidden] = f"-1;#{label}|{guid}"
-                            
-                        if payload:
-                            fields_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items/{pdf.list_item_id}/fields"
-                            patch_resp = await client.patch(fields_url, json=payload, headers=headers)
-                            if patch_resp.status_code == 200:
-                                print(f"Etiquetas de SharePoint actualizadas con éxito vía Graph (campos ocultos).", flush=True)
-                            else:
-                                sp_error = f"Graph returned status {patch_resp.status_code}"
-                                print(f"Graph update failed for hidden fields: {patch_resp.text}", flush=True)
-            except Exception as e:
-                sp_error = f"SharePoint Update Exception: {e}"
-                print(f"SharePoint Update Exception: {e}", flush=True)
+            success, err = await update_sp_metadata(pdf.list_item_id, req.area_tag, req.empresa_tag)
+            if not success:
+                sp_error = err
                 
         sync_db_to_sp()
         return {
