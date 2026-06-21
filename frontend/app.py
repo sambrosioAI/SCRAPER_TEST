@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 st.set_page_config(page_title="Scraper Universal", layout="wide")
 
 # Initialize session state keys for widget resets
-for key_init in ["pdf_select_counter", "new_emp_counter", "scrap_new_emp_counter", "target_url_counter"]:
+for key_init in ["pdf_select_counter", "new_emp_counter", "scrap_new_emp_counter", "target_url_counter", "scrap_area_counter", "scrap_empresa_counter"]:
     if key_init not in st.session_state:
         st.session_state[key_init] = 0
 
@@ -96,7 +96,7 @@ with col1:
         "Selecciona el Área para el Scrap:",
         options=area_scrap_options,
         format_func=lambda x: x.split("|")[0] if "|" in x else x,
-        key="scrap_area_widget"
+        key=f"scrap_area_widget_{st.session_state.scrap_area_counter}"
     )
     
     st.write("**Empresa Estudiada (SharePoint)**")
@@ -105,7 +105,7 @@ with col1:
         "Selecciona la Empresa para el Scrap:",
         options=emp_scrap_options,
         format_func=lambda x: x.split("|")[0] if "|" in x else x,
-        key="scrap_empresa_widget"
+        key=f"scrap_empresa_widget_{st.session_state.scrap_empresa_counter}"
     )
     
     # Formulario para crear una nueva etiqueta de Empresa en la parte de Scraping
@@ -169,10 +169,10 @@ with col1:
                             data = res.json()
                             st.success(f"¡Scraping completado! Descargados: **{data['downloaded_count']}**, Omitidos (Duplicados o ya existentes): **{data['skipped_count']}**")
                             
-                            # Incrementar contador para vaciar el input de URL y resetear selectores
+                            # Incrementar contador para vaciar el input de URL y resetear selectores de forma segura
                             st.session_state.target_url_counter += 1
-                            st.session_state.scrap_area_widget = "-- Sin Asignar --"
-                            st.session_state.scrap_empresa_widget = "-- Sin Asignar --"
+                            st.session_state.scrap_area_counter += 1
+                            st.session_state.scrap_empresa_counter += 1
                             
                             get_pdfs.clear()
                             get_targets.clear()
