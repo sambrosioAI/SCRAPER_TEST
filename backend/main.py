@@ -105,41 +105,61 @@ async def get_sp_identifiers(client, headers):
     return _SP_CACHE["site_id"], _SP_CACHE["drive_id"]
 
 async def upload_to_sp(filename: str, content: bytes, folder_path: str) -> tuple:
-    try:
-        token = await get_graph_token()
-        headers = {"Authorization": f"Bearer {token}"}
-        
-        async with httpx.AsyncClient() as client:
-            _, drive_id = await get_sp_identifiers(client, headers)
+    """
+    Uploads a file to SharePoint and resolves its listItem ID.
+    Retries the PUT up to 3 times on timeout/connection errors.
+    Uses a 300-second timeout to handle large PDF files.
+    """
+    # Generous timeout: connect=30s, read=300s (large PDFs can take a while)
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
+    
+    for upload_attempt in range(3):
+        try:
+            token = await get_graph_token()
+            headers = {"Authorization": f"Bearer {token}"}
             
-            # Upload File directly
-            graph_folder = folder_path.replace("Shared Documents/", "").replace("Documents/", "").strip("/")
-            upload_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{graph_folder}/{filename}:/content"
-            put_resp = await client.put(upload_url, headers=headers, content=content)
-            put_resp.raise_for_status()
-            
-            drive_item = put_resp.json()
-            drive_item_id = drive_item.get("id")
-            
-            # Resolve the listItem ID with retries to handle SharePoint indexing delay
-            li_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{drive_item_id}/listItem"
-            list_item_id = None
-            for attempt in range(5):
-                li_resp = await client.get(li_url, headers=headers)
-                if li_resp.status_code == 200:
-                    list_item_id = li_resp.json().get("id")
-                    break
-                else:
-                    print(f"Intento {attempt+1} para obtener listItem de {filename} falló (status {li_resp.status_code}). Reintentando en 1s...", flush=True)
-                    await asyncio.sleep(1)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                _, drive_id = await get_sp_identifiers(client, headers)
                 
-            print(f"Archivo {filename} subido con éxito. DriveItem: {drive_item_id}, ListItem: {list_item_id}")
-            return drive_item_id, list_item_id
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"Error subiendo {filename} a SharePoint: {e}", flush=True)
-        return None, None
+                # Upload File directly
+                graph_folder = folder_path.replace("Shared Documents/", "").replace("Documents/", "").strip("/")
+                upload_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{graph_folder}/{filename}:/content"
+                print(f"Subiendo {filename} a SharePoint (intento {upload_attempt+1}/3, {len(content)//1024} KB)...", flush=True)
+                put_resp = await client.put(upload_url, headers=headers, content=content)
+                put_resp.raise_for_status()
+                
+                drive_item = put_resp.json()
+                drive_item_id = drive_item.get("id")
+                
+                # Resolve the listItem ID with retries to handle SharePoint indexing delay
+                li_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{drive_item_id}/listItem"
+                list_item_id = None
+                for attempt in range(6):
+                    li_resp = await client.get(li_url, headers=headers)
+                    if li_resp.status_code == 200:
+                        list_item_id = li_resp.json().get("id")
+                        break
+                    else:
+                        print(f"Intento {attempt+1}/6 para obtener listItem de {filename} (status {li_resp.status_code}). Esperando 2s...", flush=True)
+                        await asyncio.sleep(2)
+                    
+                print(f"Archivo {filename} subido con éxito. DriveItem: {drive_item_id}, ListItem: {list_item_id}", flush=True)
+                return drive_item_id, list_item_id
+
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
+            print(f"[Upload] Timeout subiendo {filename} (intento {upload_attempt+1}/3): {e}", flush=True)
+            if upload_attempt < 2:
+                wait = (upload_attempt + 1) * 5
+                print(f"[Upload] Reintentando en {wait}s...", flush=True)
+                await asyncio.sleep(wait)
+            else:
+                print(f"[Upload] Agotados los reintentos para {filename}. Se registrará como pendiente.", flush=True)
+                return None, None
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[Upload] Error inesperado subiendo {filename}: {e}", flush=True)
+            return None, None
 
 def sync_db_to_sp():
     # Helper to run async upload from sync context
@@ -448,8 +468,10 @@ async def verify_and_fix_tags_for_target(target_url: str):
     try:
         token = await get_graph_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        timeout = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0)
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            _, drive_id = await get_sp_identifiers(client, headers)
             await _warm_sp_meta_cache(client, headers)
             list_id = _SP_META_CACHE["list_id"]
             if not list_id:
@@ -461,6 +483,8 @@ async def verify_and_fix_tags_for_target(target_url: str):
 
             async with AsyncSessionLocal() as session:
                 from sqlalchemy import or_
+
+                # ── Phase 1: files with list_item_id – verify actual SP field values ──
                 res = await session.execute(
                     select(ScrapedPDF).filter(
                         ScrapedPDF.parent_target_url == target_url,
@@ -468,19 +492,31 @@ async def verify_and_fix_tags_for_target(target_url: str):
                         or_(ScrapedPDF.area_tag != None, ScrapedPDF.empresa_tag != None)
                     )
                 )
-                pdfs = res.scalars().all()
+                pdfs_with_id = res.scalars().all()
 
-                if not pdfs:
+                # ── Phase 2: files with list_item_id=NULL – may exist in SP despite upload error ──
+                res2 = await session.execute(
+                    select(ScrapedPDF).filter(
+                        ScrapedPDF.parent_target_url == target_url,
+                        ScrapedPDF.list_item_id == None,
+                        or_(ScrapedPDF.area_tag != None, ScrapedPDF.empresa_tag != None)
+                    )
+                )
+                pdfs_without_id = res2.scalars().all()
+
+                total = len(pdfs_with_id) + len(pdfs_without_id)
+                if not total:
                     print(f"[Verify] No hay PDFs con etiquetas para verificar en {target_url}", flush=True)
                     return
 
-                print(f"[Verify] Verificando {len(pdfs)} archivos en SharePoint...", flush=True)
+                print(f"[Verify] Verificando {len(pdfs_with_id)} archivos con ID + {len(pdfs_without_id)} sin ID en SP...", flush=True)
                 fixed = 0
                 already_ok = 0
+                recovered = 0
 
-                for pdf in pdfs:
+                # ── Phase 1 loop: read fields, patch if missing ──
+                for pdf in pdfs_with_id:
                     try:
-                        # Read current field values from SharePoint
                         fields_url = (
                             f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
                             f"/lists/{list_id}/items/{pdf.list_item_id}/fields"
@@ -495,7 +531,6 @@ async def verify_and_fix_tags_for_target(target_url: str):
                         current_area = current_fields.get(area_hidden, "") or ""
                         current_empresa = current_fields.get(empresa_hidden, "") or ""
 
-                        # Build expected values
                         expected_area = ""
                         expected_empresa = ""
                         if pdf.area_tag and "|" in pdf.area_tag:
@@ -505,8 +540,6 @@ async def verify_and_fix_tags_for_target(target_url: str):
                             label, guid = pdf.empresa_tag.split("|")
                             expected_empresa = f"-1;#{label}|{guid}"
 
-                        # Compare — SharePoint stores taxonomy as "id;#Label|guid"
-                        # We check if expected guid appears anywhere in the stored value
                         area_ok = (not expected_area) or (pdf.area_tag.split("|")[-1] in current_area)
                         empresa_ok = (not expected_empresa) or (pdf.empresa_tag.split("|")[-1] in current_empresa)
 
@@ -516,9 +549,7 @@ async def verify_and_fix_tags_for_target(target_url: str):
                                 pdf.tags_synced = 1
                             continue
 
-                        # Tags are missing or wrong — patch them
-                        print(f"[Verify] Corrigiendo etiquetas de {pdf.filename} "
-                              f"(area_ok={area_ok}, empresa_ok={empresa_ok})", flush=True)
+                        print(f"[Verify] Corrigiendo {pdf.filename} (area_ok={area_ok}, empresa_ok={empresa_ok})", flush=True)
                         payload = {}
                         if expected_area:
                             payload[area_hidden] = expected_area
@@ -533,17 +564,68 @@ async def verify_and_fix_tags_for_target(target_url: str):
                         if patch_resp.status_code == 200:
                             pdf.tags_synced = 1
                             fixed += 1
-                            print(f"[Verify] ✓ Etiquetas corregidas para {pdf.filename}", flush=True)
+                            print(f"[Verify] ✓ Corregido: {pdf.filename}", flush=True)
                         else:
-                            print(f"[Verify] ✗ Fallo al corregir {pdf.filename}: "
-                                  f"{patch_resp.status_code} {patch_resp.text[:200]}", flush=True)
+                            print(f"[Verify] ✗ Fallo PATCH {pdf.filename}: {patch_resp.status_code} {patch_resp.text[:200]}", flush=True)
 
                     except Exception as e:
-                        print(f"[Verify] Error procesando {pdf.filename}: {e}", flush=True)
+                        print(f"[Verify] Error en fase 1 para {pdf.filename}: {e}", flush=True)
+
+                # ── Phase 2 loop: try to find in SP by path and tag ──
+                for pdf in pdfs_without_id:
+                    try:
+                        print(f"[Verify] Buscando en SP por ruta: {pdf.filename}", flush=True)
+                        path_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/data/pdfs/{pdf.filename}"
+                        resp = await client.get(path_url, headers=headers, params={"$expand": "listItem"})
+                        if resp.status_code != 200:
+                            print(f"[Verify] {pdf.filename} no encontrado en SP (status={resp.status_code}) — se reintentará más tarde", flush=True)
+                            continue
+
+                        data = resp.json()
+                        pdf.drive_item_id = data.get("id")
+                        pdf.list_item_id = data.get("listItem", {}).get("id")
+
+                        if not pdf.list_item_id:
+                            print(f"[Verify] {pdf.filename} encontrado pero sin listItem aún, esperando 3s...", flush=True)
+                            await asyncio.sleep(3)
+                            resp2 = await client.get(path_url, headers=headers, params={"$expand": "listItem"})
+                            if resp2.status_code == 200:
+                                pdf.list_item_id = resp2.json().get("listItem", {}).get("id")
+
+                        if not pdf.list_item_id:
+                            print(f"[Verify] {pdf.filename}: listItem aún no disponible, se intentará en el próximo arranque", flush=True)
+                            continue
+
+                        print(f"[Verify] {pdf.filename} recuperado. ListItem={pdf.list_item_id}. Aplicando etiquetas...", flush=True)
+                        payload = {}
+                        if pdf.area_tag and "|" in pdf.area_tag:
+                            label, guid = pdf.area_tag.split("|")
+                            payload[area_hidden] = f"-1;#{label}|{guid}"
+                        if pdf.empresa_tag and "|" in pdf.empresa_tag:
+                            label, guid = pdf.empresa_tag.split("|")
+                            payload[empresa_hidden] = f"-1;#{label}|{guid}"
+
+                        if payload:
+                            patch_resp = await client.patch(
+                                f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+                                f"/lists/{list_id}/items/{pdf.list_item_id}/fields",
+                                json=payload, headers=headers
+                            )
+                            if patch_resp.status_code == 200:
+                                pdf.tags_synced = 1
+                                recovered += 1
+                                print(f"[Verify] ✓ Recuperado y etiquetado: {pdf.filename}", flush=True)
+                            else:
+                                print(f"[Verify] ✗ Fallo PATCH en recuperación {pdf.filename}: {patch_resp.status_code}", flush=True)
+                        else:
+                            pdf.tags_synced = 1
+
+                    except Exception as e:
+                        print(f"[Verify] Error en fase 2 para {pdf.filename}: {e}", flush=True)
 
                 await session.commit()
                 sync_db_to_sp()
-                print(f"[Verify] Verificación completada. Correctos: {already_ok}, Corregidos: {fixed}", flush=True)
+                print(f"[Verify] ✓ Completado. Correctos: {already_ok} | Corregidos: {fixed} | Recuperados: {recovered}", flush=True)
 
     except Exception as e:
         import traceback
