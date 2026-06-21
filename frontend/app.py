@@ -158,8 +158,8 @@ else:
     df["Tamaño (MB)"] = (df["size_bytes"] / (1024 * 1024)).map("{:.2f} MB".format)
     
     # Formatear etiquetas de taxonomía para la tabla
-    df["Área Solicitante"] = df["area_tag"].apply(lambda x: x.split("|")[0] if x and "|" in x else "")
-    df["Empresa Estudiada"] = df["empresa_tag"].apply(lambda x: x.split("|")[0] if x and "|" in x else "")
+    df["Área Solicitante"] = df["area_tag"].apply(lambda x: x.split("|")[0] if isinstance(x, str) and "|" in x else "")
+    df["Empresa Estudiada"] = df["empresa_tag"].apply(lambda x: x.split("|")[0] if isinstance(x, str) and "|" in x else "")
     
     df.rename(columns={"filename": "Nombre del Archivo", "source_url": "URL de Origen"}, inplace=True)
     
