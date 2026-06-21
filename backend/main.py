@@ -41,6 +41,14 @@ _SP_CACHE = {
     "drive_id": None
 }
 
+# Cache for SharePoint list metadata (list_id + hidden taxonomy column names)
+# Populated once at startup or on first call to update_sp_metadata.
+_SP_META_CACHE: dict = {
+    "list_id": None,
+    "area_hidden": "b7fd4b1dee4d4886a868470f8808f500",     # fallback
+    "empresa_hidden": "n11a72e1dda14adca329b2b677e5c9a8"  # fallback
+}
+
 async def get_graph_token():
     url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     data = {
@@ -162,6 +170,7 @@ class ScrapedPDF(Base):
     list_item_id = Column(String, nullable=True)
     area_tag = Column(String, nullable=True)
     empresa_tag = Column(String, nullable=True)
+    tags_synced = Column(Integer, default=0, nullable=True)  # 1 = etiquetas aplicadas en SP, 0 = pendiente
 
 class ScrapedTarget(Base):
     __tablename__ = "scraped_targets"
@@ -172,53 +181,95 @@ class ScrapedTarget(Base):
     total_pdfs_found = Column(Integer, default=0)
 
 async def sync_missing_metadata():
+    """
+    Runs at startup. Heals two classes of broken records:
+      1. list_item_id IS NULL  → file uploaded but SP indexing failed; re-resolve via Graph path.
+      2. list_item_id NOT NULL but tags_synced = 0 or NULL → IDs resolved but PATCH failed; retry PATCH.
+    """
     print("[Sync] Iniciando sincronización de metadatos faltantes en SharePoint...", flush=True)
     async with AsyncSessionLocal() as session:
         try:
-            result = await session.execute(
+            # --- Group 1: missing list_item_id ---
+            res1 = await session.execute(
                 select(ScrapedPDF).filter(
                     (ScrapedPDF.list_item_id == None) | (ScrapedPDF.drive_item_id == None)
                 )
             )
-            pdf_items = result.scalars().all()
-            if not pdf_items:
-                print("[Sync] No hay PDFs sin list_item_id/drive_item_id.", flush=True)
+            group1 = res1.scalars().all()
+
+            # --- Group 2: has list_item_id, has tags, but tags_synced is 0/NULL ---
+            from sqlalchemy import or_
+            res2 = await session.execute(
+                select(ScrapedPDF).filter(
+                    ScrapedPDF.list_item_id != None,
+                    or_(ScrapedPDF.tags_synced == None, ScrapedPDF.tags_synced == 0),
+                    or_(ScrapedPDF.area_tag != None, ScrapedPDF.empresa_tag != None)
+                )
+            )
+            group2 = res2.scalars().all()
+
+            if not group1 and not group2:
+                print("[Sync] Todos los PDFs tienen metadatos completos en SharePoint. Nada que sincronizar.", flush=True)
                 return
 
-            print(f"[Sync] Encontrados {len(pdf_items)} PDFs para resolver e indexar.", flush=True)
             token = await get_graph_token()
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             async with httpx.AsyncClient() as client:
                 _, drive_id = await get_sp_identifiers(client, headers)
+                # Warm the metadata cache once before the loop
+                await _warm_sp_meta_cache(client, headers)
                 
                 updated_any = False
-                for pdf in pdf_items:
-                    print(f"[Sync] Resolviendo {pdf.filename}...", flush=True)
+
+                # --- Heal Group 1: resolve missing IDs ---
+                if group1:
+                    print(f"[Sync] Grupo 1: {len(group1)} PDFs sin list_item_id. Resolviendo...", flush=True)
+                for pdf in group1:
+                    print(f"[Sync] Resolviendo IDs para {pdf.filename}...", flush=True)
                     path_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/data/pdfs/{pdf.filename}"
-                    params = {"$expand": "listItem"}
-                    resp = await client.get(path_url, headers=headers, params=params)
+                    resp = await client.get(path_url, headers=headers, params={"$expand": "listItem"})
                     if resp.status_code == 200:
                         data = resp.json()
                         pdf.drive_item_id = data.get("id")
                         pdf.list_item_id = data.get("listItem", {}).get("id")
-                        print(f"[Sync] Resolvido: DriveItem={pdf.drive_item_id}, ListItem={pdf.list_item_id}", flush=True)
-                        
-                        # Si tiene etiquetas, actualizarlas en SharePoint
+                        print(f"[Sync] IDs resueltos: DriveItem={pdf.drive_item_id}, ListItem={pdf.list_item_id}", flush=True)
                         if pdf.list_item_id and (pdf.area_tag or pdf.empresa_tag):
                             success, err = await update_sp_metadata(pdf.list_item_id, pdf.area_tag, pdf.empresa_tag)
                             if success:
-                                print(f"[Sync] Etiquetas actualizadas en SharePoint para {pdf.filename}", flush=True)
+                                pdf.tags_synced = 1
+                                print(f"[Sync] Etiquetas aplicadas en SP para {pdf.filename}", flush=True)
                             else:
-                                print(f"[Sync] Error actualizando etiquetas en SharePoint para {pdf.filename}: {err}", flush=True)
+                                print(f"[Sync] Error aplicando etiquetas en SP para {pdf.filename}: {err}", flush=True)
+                        elif not (pdf.area_tag or pdf.empresa_tag):
+                            pdf.tags_synced = 1  # no hay etiquetas que aplicar
                         updated_any = True
                     else:
-                        print(f"[Sync] No se pudo resolver {pdf.filename} por ruta (status={resp.status_code}): {resp.text[:200]}", flush=True)
-                
+                        print(f"[Sync] No se pudo resolver {pdf.filename} (status={resp.status_code})", flush=True)
+
+                # --- Heal Group 2: retry failed PATCH ---
+                if group2:
+                    print(f"[Sync] Grupo 2: {len(group2)} PDFs con IDs pero sin etiquetas en SP. Reintentando PATCH...", flush=True)
+                for pdf in group2:
+                    if not (pdf.area_tag or pdf.empresa_tag):
+                        pdf.tags_synced = 1
+                        updated_any = True
+                        continue
+                    print(f"[Sync] Reintentando etiquetas para {pdf.filename} (list_item={pdf.list_item_id})...", flush=True)
+                    success, err = await update_sp_metadata(pdf.list_item_id, pdf.area_tag, pdf.empresa_tag)
+                    if success:
+                        pdf.tags_synced = 1
+                        print(f"[Sync] Etiquetas aplicadas en SP para {pdf.filename}", flush=True)
+                    else:
+                        print(f"[Sync] Error en reintento para {pdf.filename}: {err}", flush=True)
+                    updated_any = True
+
                 if updated_any:
                     await session.commit()
                     sync_db_to_sp()
                     print("[Sync] Sincronización completada y base de datos guardada en SharePoint.", flush=True)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[Sync] Error durante la sincronización: {e}", flush=True)
 
 # Create tables if not exist
@@ -253,7 +304,8 @@ async def startup():
                 "drive_item_id": "TEXT",
                 "list_item_id": "TEXT",
                 "area_tag": "TEXT",
-                "empresa_tag": "TEXT"
+                "empresa_tag": "TEXT",
+                "tags_synced": "INTEGER DEFAULT 0"
             }
             for col_name, col_type in new_cols.items():
                 if col_name not in existing_cols:
@@ -300,9 +352,44 @@ class TargetResponse(BaseModel):
     class Config:
         from_attributes = True
 
+async def _warm_sp_meta_cache(client: httpx.AsyncClient, headers: dict):
+    """
+    Resolves and caches the SharePoint list_id and hidden taxonomy column names.
+    Called once at startup and reused in every update_sp_metadata call.
+    """
+    global _SP_META_CACHE
+    if _SP_META_CACHE["list_id"]:
+        return  # already warm
+    
+    _, drive_id = await get_sp_identifiers(client, headers)
+    
+    list_info_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
+    list_resp = await client.get(list_info_url, headers=headers)
+    if list_resp.status_code != 200:
+        print(f"[MetaCache] No se pudo obtener list_id: {list_resp.status_code} {list_resp.text[:200]}", flush=True)
+        return
+    
+    _SP_META_CACHE["list_id"] = list_resp.json().get("id")
+    
+    cols_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{_SP_META_CACHE['list_id']}/columns"
+    cols_resp = await client.get(cols_url, headers=headers, params={"$select": "name,displayName,hidden"})
+    if cols_resp.status_code == 200:
+        for col in cols_resp.json().get("value", []):
+            disp = col.get("displayName", "")
+            name = col.get("name", "")
+            if col.get("hidden") and disp == "Area solicitante_0":
+                _SP_META_CACHE["area_hidden"] = name
+            elif col.get("hidden") and disp == "Empresa estudiada_0":
+                _SP_META_CACHE["empresa_hidden"] = name
+    
+    print(f"[MetaCache] Caché de metadatos SP lista. list_id={_SP_META_CACHE['list_id']}, "
+          f"area_hidden={_SP_META_CACHE['area_hidden']}, empresa_hidden={_SP_META_CACHE['empresa_hidden']}", flush=True)
+
+
 async def update_sp_metadata(list_item_id: str, area_tag: Optional[str], empresa_tag: Optional[str]) -> tuple:
     """
     Updates the hidden taxonomy fields in SharePoint for a given list_item_id.
+    Uses the global _SP_META_CACHE so no extra API calls are needed per file.
     Returns (success: bool, error: Optional[str])
     """
     if not list_item_id:
@@ -313,52 +400,36 @@ async def update_sp_metadata(list_item_id: str, area_tag: Optional[str], empresa
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         
         async with httpx.AsyncClient() as client:
-            _, drive_id = await get_sp_identifiers(client, headers)
+            # Warm cache if needed (only runs once per process lifetime)
+            await _warm_sp_meta_cache(client, headers)
             
-            list_info_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
-            list_resp = await client.get(list_info_url, headers=headers)
-            if list_resp.status_code == 200:
-                list_id = list_resp.json().get("id")
+            list_id = _SP_META_CACHE["list_id"]
+            if not list_id:
+                return False, "Failed to resolve list_id from cache"
+            
+            area_hidden = _SP_META_CACHE["area_hidden"]
+            empresa_hidden = _SP_META_CACHE["empresa_hidden"]
+            
+            payload = {}
+            if area_tag and "|" in area_tag:
+                label, guid = area_tag.split("|")
+                payload[area_hidden] = f"-1;#{label}|{guid}"
+            if empresa_tag and "|" in empresa_tag:
+                label, guid = empresa_tag.split("|")
+                payload[empresa_hidden] = f"-1;#{label}|{guid}"
                 
-                # Resolver columnas ocultas dinámicamente
-                area_hidden = "b7fd4b1dee4d4886a868470f8808f500"  # fallback
-                empresa_hidden = "n11a72e1dda14adca329b2b677e5c9a8"  # fallback
-                
-                cols_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/columns"
-                cols_params = {"$select": "name,displayName,hidden"}
-                cols_resp = await client.get(cols_url, headers=headers, params=cols_params)
-                if cols_resp.status_code == 200:
-                    cols_list = cols_resp.json().get("value", [])
-                    for col in cols_list:
-                        disp = col.get("displayName", "")
-                        name = col.get("name", "")
-                        if col.get("hidden") and disp == "Area solicitante_0":
-                            area_hidden = name
-                        elif col.get("hidden") and disp == "Empresa estudiada_0":
-                            empresa_hidden = name
-                            
-                # Preparar el payload con las columnas ocultas correctas
-                payload = {}
-                if area_tag and "|" in area_tag:
-                    label, guid = area_tag.split("|")
-                    payload[area_hidden] = f"-1;#{label}|{guid}"
-                if empresa_tag and "|" in empresa_tag:
-                    label, guid = empresa_tag.split("|")
-                    payload[empresa_hidden] = f"-1;#{label}|{guid}"
-                    
-                if payload:
-                    fields_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items/{list_item_id}/fields"
-                    patch_resp = await client.patch(fields_url, json=payload, headers=headers)
-                    if patch_resp.status_code == 200:
-                        print(f"Etiquetas de SharePoint actualizadas con éxito vía Graph (campos ocultos).", flush=True)
-                        return True, None
-                    else:
-                        err_msg = f"Graph returned status {patch_resp.status_code}: {patch_resp.text}"
-                        print(f"Graph update failed for hidden fields: {err_msg}", flush=True)
-                        return False, err_msg
-                else:
-                    return True, None
-            return False, "Failed to resolve list_id"
+            if not payload:
+                return True, None
+            
+            fields_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items/{list_item_id}/fields"
+            patch_resp = await client.patch(fields_url, json=payload, headers=headers)
+            if patch_resp.status_code == 200:
+                print(f"Etiquetas de SharePoint actualizadas con éxito (list_item={list_item_id}).", flush=True)
+                return True, None
+            else:
+                err_msg = f"Graph returned status {patch_resp.status_code}: {patch_resp.text}"
+                print(f"Graph update failed: {err_msg}", flush=True)
+                return False, err_msg
     except Exception as e:
         err_msg = f"SharePoint Update Exception: {e}"
         print(err_msg, flush=True)
@@ -404,9 +475,13 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                             # Subir a SharePoint via Graph REST
                             drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
                             
-                            # If tags are provided, update them in SharePoint immediately
+                            # Apply tags and track whether the PATCH succeeded
+                            tags_synced_flag = 0
                             if list_item_id and (area_tag or empresa_tag):
-                                await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+                                tag_ok, _ = await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+                                tags_synced_flag = 1 if tag_ok else 0
+                            elif not (area_tag or empresa_tag):
+                                tags_synced_flag = 1  # nothing to tag
 
                             new_pdf = ScrapedPDF(
                                 filename=filename, 
@@ -416,7 +491,8 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                                 drive_item_id=drive_item_id,
                                 list_item_id=list_item_id,
                                 area_tag=area_tag,
-                                empresa_tag=empresa_tag
+                                empresa_tag=empresa_tag,
+                                tags_synced=tags_synced_flag
                             )
                             session.add(new_pdf)
                             await session.commit()
@@ -592,9 +668,13 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                     
                     drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
                     
-                    # If tags are provided, update them in SharePoint immediately
+                    # Apply tags and track whether the PATCH succeeded
+                    tags_synced_flag = 0
                     if list_item_id and (area_tag or empresa_tag):
-                        await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+                        tag_ok, _ = await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+                        tags_synced_flag = 1 if tag_ok else 0
+                    elif not (area_tag or empresa_tag):
+                        tags_synced_flag = 1  # nothing to tag, considered done
 
                     session.add(ScrapedPDF(
                         filename=filename, 
@@ -604,7 +684,8 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                         drive_item_id=drive_item_id,
                         list_item_id=list_item_id,
                         area_tag=area_tag,
-                        empresa_tag=empresa_tag
+                        empresa_tag=empresa_tag,
+                        tags_synced=tags_synced_flag
                     ))
                     await session.commit()
                     downloaded += 1
