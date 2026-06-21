@@ -672,6 +672,27 @@ async def tag_pdf(pdf_id: int, req: TagPDFRequest):
         await session.commit()
         
         sp_error = None
+        
+        # Si no tiene list_item_id o drive_item_id, lo resolvemos dinámicamente usando la ruta en el drive
+        if not pdf.list_item_id or not pdf.drive_item_id:
+            try:
+                token = await get_graph_token()
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                async with httpx.AsyncClient() as client:
+                    _, drive_id = await get_sp_identifiers(client, headers)
+                    
+                    path_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/data/pdfs/{pdf.filename}"
+                    params = {"$expand": "listItem"}
+                    resp = await client.get(path_url, headers=headers, params=params)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        pdf.drive_item_id = data.get("id")
+                        pdf.list_item_id = data.get("listItem", {}).get("id")
+                        await session.commit()
+                        print(f"Resolved and saved drive_item_id ({pdf.drive_item_id}) and list_item_id ({pdf.list_item_id}) dynamically for {pdf.filename}", flush=True)
+            except Exception as e:
+                print(f"Error resolving list_item_id dynamically by path: {e}", flush=True)
+
         if pdf.list_item_id:
             try:
                 token = await get_graph_token()
@@ -680,79 +701,48 @@ async def tag_pdf(pdf_id: int, req: TagPDFRequest):
                 async with httpx.AsyncClient() as client:
                     _, drive_id = await get_sp_identifiers(client, headers)
                     
-                    # Query drive list ID dynamically
                     list_info_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
                     list_resp = await client.get(list_info_url, headers=headers)
                     if list_resp.status_code == 200:
                         list_id = list_resp.json().get("id")
                         
-                        # Prepare payload
+                        # Resolver columnas ocultas dinámicamente
+                        area_hidden = "b7fd4b1dee4d4886a868470f8808f500"  # fallback
+                        empresa_hidden = "n11a72e1dda14adca329b2b677e5c9a8"  # fallback
+                        
+                        cols_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/columns"
+                        cols_params = {"$select": "name,displayName,hidden"}
+                        cols_resp = await client.get(cols_url, headers=headers, params=cols_params)
+                        if cols_resp.status_code == 200:
+                            cols_list = cols_resp.json().get("value", [])
+                            for col in cols_list:
+                                disp = col.get("displayName", "")
+                                name = col.get("name", "")
+                                if col.get("hidden") and disp == "Area solicitante_0":
+                                    area_hidden = name
+                                elif col.get("hidden") and disp == "Empresa estudiada_0":
+                                    empresa_hidden = name
+                                    
+                        # Preparar el payload con las columnas ocultas correctas
                         payload = {}
                         if req.area_tag and "|" in req.area_tag:
                             label, guid = req.area_tag.split("|")
-                            payload["Area_x0020_solicitante"] = {"Label": label, "TermGuid": guid, "WssId": -1}
+                            payload[area_hidden] = f"-1;#{label}|{guid}"
                         if req.empresa_tag and "|" in req.empresa_tag:
                             label, guid = req.empresa_tag.split("|")
-                            payload["Empresa_x0020_estudiada"] = {"Label": label, "TermGuid": guid, "WssId": -1}
+                            payload[empresa_hidden] = f"-1;#{label}|{guid}"
                             
                         if payload:
-                            # 1. Best effort Graph PATCH
                             fields_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items/{pdf.list_item_id}/fields"
                             patch_resp = await client.patch(fields_url, json=payload, headers=headers)
                             if patch_resp.status_code == 200:
-                                print(f"Etiquetas de SharePoint actualizadas con éxito vía Graph.")
+                                print(f"Etiquetas de SharePoint actualizadas con éxito vía Graph (campos ocultos).", flush=True)
                             else:
                                 sp_error = f"Graph returned status {patch_resp.status_code}"
-                                print(f"Graph update failed, trying SP REST fallback: {patch_resp.text[:200]}")
-                                
-                                # 2. Fallback using classic SP REST validateupdatelistitem
-                                try:
-                                    sp_token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-                                    sp_token_resp = await client.post(sp_token_url, data={
-                                        "client_id": CLIENT_ID,
-                                        "client_secret": CLIENT_SECRET,
-                                        "scope": "https://inmobcolonial.sharepoint.com/.default",
-                                        "grant_type": "client_credentials",
-                                    })
-                                    if sp_token_resp.status_code == 200:
-                                        sp_token = sp_token_resp.json().get("access_token")
-                                        sp_headers = {
-                                            "Authorization": f"Bearer {sp_token}",
-                                            "Accept": "application/json;odata=nometadata",
-                                            "Content-Type": "application/json"
-                                        }
-                                        
-                                        form_values = []
-                                        if req.area_tag and "|" in req.area_tag:
-                                            label, guid = req.area_tag.split("|")
-                                            form_values.append({"FieldName": "Area_x0020_solicitante", "FieldValue": f"-1;#{label}|{guid}"})
-                                        if req.empresa_tag and "|" in req.empresa_tag:
-                                            label, guid = req.empresa_tag.split("|")
-                                            form_values.append({"FieldName": "Empresa_x0020_estudiada", "FieldValue": f"-1;#{label}|{guid}"})
-                                            
-                                        if form_values:
-                                            parsed = urlparse(SHAREPOINT_SITE_URL)
-                                            site_url = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
-                                            rest_url = f"{site_url}/_api/web/lists(guid'{list_id}')/items({pdf.list_item_id})/validateupdatelistitem()"
-                                            
-                                            rest_payload = {
-                                                "formValues": form_values,
-                                                "bNewDocumentUpdate": False,
-                                                "checkInComment": ""
-                                            }
-                                            
-                                            rest_resp = await client.post(rest_url, json=rest_payload, headers=sp_headers)
-                                            if rest_resp.status_code == 200:
-                                                print("Etiquetas de SharePoint actualizadas con éxito vía REST.")
-                                                sp_error = None
-                                            else:
-                                                sp_error = f"SP REST returned {rest_resp.status_code}"
-                                    else:
-                                        sp_error = "Failed to obtain SP REST Token"
-                                except Exception as inner:
-                                    sp_error = f"REST Fallback Exception: {inner}"
+                                print(f"Graph update failed for hidden fields: {patch_resp.text}", flush=True)
             except Exception as e:
                 sp_error = f"SharePoint Update Exception: {e}"
+                print(f"SharePoint Update Exception: {e}", flush=True)
                 
         sync_db_to_sp()
         return {
