@@ -652,7 +652,8 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                 try:
                     filename = target_url.split("/")[-1].split("?")[0]
                     if not filename.lower().endswith(".pdf"):
-                     # Prevent filename collisions: Skip if filename already exists in DB
+                        filename = "document_direct.pdf"
+                    # Prevent filename collisions: Skip if filename already exists in DB
                     async with AsyncSessionLocal() as session_check:
                         name_check = await session_check.execute(select(ScrapedPDF).filter(ScrapedPDF.filename == filename))
                         if name_check.scalars().first():
@@ -725,24 +726,25 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                             if file_failed:
                                 failed_files.append(filename)
                                 print(f"[FALLO DEFINITIVO Direct PDF] {filename} no pudo guardarse tras {MAX_ATTEMPTS} intentos: {last_error}", flush=True)
-                     
-             # Upsert Target
-             result_target = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.target_url == target_url))
-             existing_target = result_target.scalars().first()
-             if existing_target:
-                 existing_target.last_scraped_date = datetime.utcnow()
-                 existing_target.total_pdfs_found += downloaded
-             else:
-                 session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=downloaded))
-             await session.commit()
-             
-         sync_db_to_sp()
-         return {
-             "downloaded_count": downloaded,
-             "skipped_count": skipped,
-             "message": "Direct PDF download complete",
-             "failed_files": failed_files
-         }
+                except Exception as e:
+                    print(f"Error general en descarga directa: {e}", flush=True)
+            # Upsert Target
+            result_target = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.target_url == target_url))
+            existing_target = result_target.scalars().first()
+            if existing_target:
+                existing_target.last_scraped_date = datetime.utcnow()
+                existing_target.total_pdfs_found += downloaded
+            else:
+                session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=downloaded))
+            await session.commit()
+
+        sync_db_to_sp()
+        return {
+            "downloaded_count": downloaded,
+            "skipped_count": skipped,
+            "message": "Direct PDF download complete",
+            "failed_files": failed_files
+        }
 
     
     # Lógica con Playwright
@@ -1182,4 +1184,5 @@ async def tag_pdf(pdf_id: int, req: TagPDFRequest):
             "sp_updated": sp_error is None,
             "sp_error": sp_error
         }
+
 
