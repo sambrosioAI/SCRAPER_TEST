@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Response
 from fastapi.responses import JSONResponse
@@ -96,7 +96,7 @@ async def get_sp_identifiers(client, headers):
     
     return _SP_CACHE["site_id"], _SP_CACHE["drive_id"]
 
-async def upload_to_sp(filename: str, content: bytes, folder_path: str):
+async def upload_to_sp(filename: str, content: bytes, folder_path: str) -> tuple:
     try:
         token = await get_graph_token()
         headers = {"Authorization": f"Bearer {token}"}
@@ -104,15 +104,27 @@ async def upload_to_sp(filename: str, content: bytes, folder_path: str):
         async with httpx.AsyncClient() as client:
             _, drive_id = await get_sp_identifiers(client, headers)
             
-            # 3. Upload File directly to the known drive
+            # Upload File directly
             graph_folder = folder_path.replace("Shared Documents/", "").replace("Documents/", "").strip("/")
             upload_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{graph_folder}/{filename}:/content"
             put_resp = await client.put(upload_url, headers=headers, content=content)
             put_resp.raise_for_status()
             
-        print(f"Archivo {filename} subido con éxito a SharePoint (Graph REST).")
+            drive_item = put_resp.json()
+            drive_item_id = drive_item.get("id")
+            
+            # Resolve the listItem ID
+            li_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{drive_item_id}/listItem"
+            li_resp = await client.get(li_url, headers=headers)
+            list_item_id = None
+            if li_resp.status_code == 200:
+                list_item_id = li_resp.json().get("id")
+                
+            print(f"Archivo {filename} subido con éxito. DriveItem: {drive_item_id}, ListItem: {list_item_id}")
+            return drive_item_id, list_item_id
     except Exception as e:
-        print(f"Error subiendo {filename} a SharePoint (Graph REST): {e}")
+        print(f"Error subiendo {filename} a SharePoint: {e}")
+        return None, None
 
 def sync_db_to_sp():
     # Helper to run async upload from sync context
@@ -139,6 +151,10 @@ class ScrapedPDF(Base):
     download_date = Column(DateTime, default=datetime.utcnow)
     size_bytes = Column(Integer, nullable=False)
     parent_target_url = Column(String, index=True, nullable=True)
+    drive_item_id = Column(String, nullable=True)
+    list_item_id = Column(String, nullable=True)
+    area_tag = Column(String, nullable=True)
+    empresa_tag = Column(String, nullable=True)
 
 class ScrapedTarget(Base):
     __tablename__ = "scraped_targets"
@@ -171,6 +187,23 @@ async def startup():
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        
+        # Migración dinámica: añadir nuevas columnas si no existen
+        try:
+            res = await conn.execute(text("PRAGMA table_info(scraped_pdfs);"))
+            existing_cols = [row[1] for row in res.fetchall()]
+            new_cols = {
+                "drive_item_id": "TEXT",
+                "list_item_id": "TEXT",
+                "area_tag": "TEXT",
+                "empresa_tag": "TEXT"
+            }
+            for col_name, col_type in new_cols.items():
+                if col_name not in existing_cols:
+                    print(f"Migrando BD: Añadiendo columna {col_name} a scraped_pdfs", flush=True)
+                    await conn.execute(text(f"ALTER TABLE scraped_pdfs ADD COLUMN {col_name} {col_type};"))
+        except Exception as e:
+            print(f"Error ejecutando migración: {e}", flush=True)
 
 # --- Pydantic Schemas ---
 
@@ -188,6 +221,10 @@ class PDFResponse(BaseModel):
     source_url: str
     download_date: datetime
     size_bytes: int
+    drive_item_id: Optional[str] = None
+    list_item_id: Optional[str] = None
+    area_tag: Optional[str] = None
+    empresa_tag: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -239,13 +276,15 @@ async def run_merlin_scraper(target_url: str) -> dict:
                             size_bytes = len(file_content)
                             
                             # Subir a SharePoint via Graph REST
-                            await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
+                            drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
                             
                             new_pdf = ScrapedPDF(
                                 filename=filename, 
                                 source_url=target_url, 
                                 size_bytes=size_bytes,
-                                parent_target_url=target_url
+                                parent_target_url=target_url,
+                                drive_item_id=drive_item_id,
+                                list_item_id=list_item_id
                             )
                             session.add(new_pdf)
                             await session.commit()
@@ -419,8 +458,15 @@ async def run_merlin_scraper(target_url: str) -> dict:
                         req.raise_for_status()
                         file_content = req.content
                     
-                    await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
-                    session.add(ScrapedPDF(filename=filename, source_url=pdf_url, size_bytes=len(file_content), parent_target_url=target_url))
+                    drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
+                    session.add(ScrapedPDF(
+                        filename=filename, 
+                        source_url=pdf_url, 
+                        size_bytes=len(file_content), 
+                        parent_target_url=target_url,
+                        drive_item_id=drive_item_id,
+                        list_item_id=list_item_id
+                    ))
                     await session.commit()
                     downloaded += 1
                 except Exception as e:
@@ -532,3 +578,185 @@ async def delete_target(target_id: int):
         await session.commit()
     sync_db_to_sp()
     return {"message": "Purged"}
+
+# --- Taxonomy & Tagging Endpoints ---
+
+TERM_SET_AREA_ID = os.getenv("TERM_SET_AREA_ID", "f82e7dcc-cc3f-4fbe-ab58-bee9349392d5")
+TERM_SET_EMPRESA_ID = os.getenv("TERM_SET_EMPRESA_ID", "0e00c022-929e-47f0-8be2-dce8362d2467")
+
+class CreateTermRequest(BaseModel):
+    name: str
+
+class TagPDFRequest(BaseModel):
+    area_tag: str = None  # Formatted as "Label|Guid"
+    empresa_tag: str = None  # Formatted as "Label|Guid"
+
+@app.get("/api/taxonomy/area/terms")
+async def get_area_terms():
+    try:
+        token = await get_graph_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/termStore/sets/{TERM_SET_AREA_ID}/terms"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            terms = resp.json().get("value", [])
+            result = []
+            for term in terms:
+                term_id = term.get("id")
+                labels = term.get("labels", [])
+                default_label = next((l.get("name") for l in labels if l.get("isDefault")), "No Name")
+                result.append({"id": term_id, "label": default_label})
+            return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al obtener áreas: {str(e)}")
+
+@app.get("/api/taxonomy/empresa/terms")
+async def get_empresa_terms():
+    try:
+        token = await get_graph_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/termStore/sets/{TERM_SET_EMPRESA_ID}/terms"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            terms = resp.json().get("value", [])
+            result = []
+            for term in terms:
+                term_id = term.get("id")
+                labels = term.get("labels", [])
+                default_label = next((l.get("name") for l in labels if l.get("isDefault")), "No Name")
+                result.append({"id": term_id, "label": default_label})
+            return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al obtener empresas: {str(e)}")
+
+@app.post("/api/taxonomy/empresa/terms")
+async def create_empresa_term(req: CreateTermRequest):
+    try:
+        token = await get_graph_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/termStore/sets/{TERM_SET_EMPRESA_ID}/children"
+        payload = {
+            "labels": [
+                {
+                    "languageTag": "es-ES",
+                    "name": req.name,
+                    "isDefault": True
+                }
+            ]
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code in [200, 201]:
+                term_data = resp.json()
+                return {"id": term_data["id"], "label": req.name}
+            else:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al crear empresa: {str(e)}")
+
+@app.post("/api/pdfs/{pdf_id}/tags")
+async def tag_pdf(pdf_id: int, req: TagPDFRequest):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.id == pdf_id))
+        pdf = result.scalars().first()
+        if not pdf:
+            raise HTTPException(status_code=404, detail="PDF no encontrado")
+        
+        pdf.area_tag = req.area_tag
+        pdf.empresa_tag = req.empresa_tag
+        await session.commit()
+        
+        sp_error = None
+        if pdf.list_item_id:
+            try:
+                token = await get_graph_token()
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                
+                async with httpx.AsyncClient() as client:
+                    _, drive_id = await get_sp_identifiers(client, headers)
+                    
+                    # Query drive list ID dynamically
+                    list_info_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
+                    list_resp = await client.get(list_info_url, headers=headers)
+                    if list_resp.status_code == 200:
+                        list_id = list_resp.json().get("id")
+                        
+                        # Prepare payload
+                        payload = {}
+                        if req.area_tag and "|" in req.area_tag:
+                            label, guid = req.area_tag.split("|")
+                            payload["Area_x0020_solicitante"] = {"Label": label, "TermGuid": guid, "WssId": -1}
+                        if req.empresa_tag and "|" in req.empresa_tag:
+                            label, guid = req.empresa_tag.split("|")
+                            payload["Empresa_x0020_estudiada"] = {"Label": label, "TermGuid": guid, "WssId": -1}
+                            
+                        if payload:
+                            # 1. Best effort Graph PATCH
+                            fields_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items/{pdf.list_item_id}/fields"
+                            patch_resp = await client.patch(fields_url, json=payload, headers=headers)
+                            if patch_resp.status_code == 200:
+                                print(f"Etiquetas de SharePoint actualizadas con éxito vía Graph.")
+                            else:
+                                sp_error = f"Graph returned status {patch_resp.status_code}"
+                                print(f"Graph update failed, trying SP REST fallback: {patch_resp.text[:200]}")
+                                
+                                # 2. Fallback using classic SP REST validateupdatelistitem
+                                try:
+                                    sp_token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+                                    sp_token_resp = await client.post(sp_token_url, data={
+                                        "client_id": CLIENT_ID,
+                                        "client_secret": CLIENT_SECRET,
+                                        "scope": "https://inmobcolonial.sharepoint.com/.default",
+                                        "grant_type": "client_credentials",
+                                    })
+                                    if sp_token_resp.status_code == 200:
+                                        sp_token = sp_token_resp.json().get("access_token")
+                                        sp_headers = {
+                                            "Authorization": f"Bearer {sp_token}",
+                                            "Accept": "application/json;odata=nometadata",
+                                            "Content-Type": "application/json"
+                                        }
+                                        
+                                        form_values = []
+                                        if req.area_tag and "|" in req.area_tag:
+                                            label, guid = req.area_tag.split("|")
+                                            form_values.append({"FieldName": "Area_x0020_solicitante", "FieldValue": f"-1;#{label}|{guid}"})
+                                        if req.empresa_tag and "|" in req.empresa_tag:
+                                            label, guid = req.empresa_tag.split("|")
+                                            form_values.append({"FieldName": "Empresa_x0020_estudiada", "FieldValue": f"-1;#{label}|{guid}"})
+                                            
+                                        if form_values:
+                                            parsed = urlparse(SHAREPOINT_SITE_URL)
+                                            site_url = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
+                                            rest_url = f"{site_url}/_api/web/lists(guid'{list_id}')/items({pdf.list_item_id})/validateupdatelistitem()"
+                                            
+                                            rest_payload = {
+                                                "formValues": form_values,
+                                                "bNewDocumentUpdate": False,
+                                                "checkInComment": ""
+                                            }
+                                            
+                                            rest_resp = await client.post(rest_url, json=rest_payload, headers=sp_headers)
+                                            if rest_resp.status_code == 200:
+                                                print("Etiquetas de SharePoint actualizadas con éxito vía REST.")
+                                                sp_error = None
+                                            else:
+                                                sp_error = f"SP REST returned {rest_resp.status_code}"
+                                    else:
+                                        sp_error = "Failed to obtain SP REST Token"
+                                except Exception as inner:
+                                    sp_error = f"REST Fallback Exception: {inner}"
+            except Exception as e:
+                sp_error = f"SharePoint Update Exception: {e}"
+                
+        sync_db_to_sp()
+        return {
+            "message": "Tags updated in local database.",
+            "sp_updated": sp_error is None,
+            "sp_error": sp_error
+        }

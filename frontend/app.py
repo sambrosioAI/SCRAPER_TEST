@@ -156,12 +156,17 @@ else:
     # Preparar datos de la tabla principal
     df["Fecha de Descarga"] = pd.to_datetime(df["download_date"]).dt.strftime("%Y-%m-%d %H:%M")
     df["Tamaño (MB)"] = (df["size_bytes"] / (1024 * 1024)).map("{:.2f} MB".format)
+    
+    # Formatear etiquetas de taxonomía para la tabla
+    df["Área Solicitante"] = df["area_tag"].apply(lambda x: x.split("|")[0] if x and "|" in x else "")
+    df["Empresa Estudiada"] = df["empresa_tag"].apply(lambda x: x.split("|")[0] if x and "|" in x else "")
+    
     df.rename(columns={"filename": "Nombre del Archivo", "source_url": "URL de Origen"}, inplace=True)
     
     # Construir la columna de enlaces con el client-facing host
     df["Ver Documento"] = client_facing_backend + "/pdfs/" + df["Nombre del Archivo"]
     
-    display_cols = ["Nombre del Archivo", "Tamaño (MB)", "Fecha de Descarga", "URL de Origen", "Ver Documento"]
+    display_cols = ["Nombre del Archivo", "Área Solicitante", "Empresa Estudiada", "Tamaño (MB)", "Fecha de Descarga", "URL de Origen", "Ver Documento"]
     
     # Renderizamos en Streamlit con column_config para hacer los enlaces clickleables nativamente
     st.dataframe(
@@ -176,3 +181,125 @@ else:
             )
         }
     )
+
+    st.write("")
+    st.write("")
+    
+    # --- UI DE ETIQUETADO DE METADATOS ---
+    st.subheader("🏷️ Asignación de Etiquetas (SharePoint)")
+    
+    # Selector de documento
+    pdf_names = [p["filename"] for p in pdfs]
+    selected_filename = st.selectbox("Selecciona un PDF de la lista para editar etiquetas:", ["-- Selecciona un archivo --"] + pdf_names)
+    
+    if selected_filename != "-- Selecciona un archivo --":
+        # Encontrar el elemento PDF correspondiente
+        pdf_item = next(p for p in pdfs if p["filename"] == selected_filename)
+        
+        # Cargar términos de taxonomía del backend
+        areas = []
+        empresas = []
+        try:
+            r_area = requests.get(f"{backend_url}/api/taxonomy/area/terms")
+            if r_area.status_code == 200:
+                areas = r_area.json()
+        except Exception as e:
+            st.warning(f"No se pudieron cargar las áreas del TermStore: {e}")
+            
+        try:
+            r_emp = requests.get(f"{backend_url}/api/taxonomy/empresa/terms")
+            if r_emp.status_code == 200:
+                empresas = r_emp.json()
+        except Exception as e:
+            st.warning(f"No se pudieron cargar las empresas del TermStore: {e}")
+            
+        col_tag_1, col_tag_2 = st.columns([1, 1])
+        
+        with col_tag_1:
+            st.write("**Área Solicitante**")
+            curr_area_label = ""
+            if pdf_item.get("area_tag") and "|" in pdf_item["area_tag"]:
+                curr_area_label = pdf_item["area_tag"].split("|")[0]
+                
+            area_options = ["-- Sin Asignar --"] + [f"{a['label']}|{a['id']}" for a in areas]
+            
+            def_idx_area = 0
+            for idx, opt in enumerate(area_options):
+                if opt.startswith(curr_area_label + "|"):
+                    def_idx_area = idx
+                    break
+                    
+            selected_area_opt = st.selectbox(
+                "Selecciona el Área:", 
+                options=area_options, 
+                index=def_idx_area,
+                format_func=lambda x: x.split("|")[0] if "|" in x else x,
+                key="select_area_widget"
+            )
+            
+        with col_tag_2:
+            st.write("**Empresa Estudiada**")
+            curr_emp_label = ""
+            if pdf_item.get("empresa_tag") and "|" in pdf_item["empresa_tag"]:
+                curr_emp_label = pdf_item["empresa_tag"].split("|")[0]
+                
+            emp_options = ["-- Sin Asignar --"] + [f"{e['label']}|{e['id']}" for e in empresas]
+            
+            def_idx_emp = 0
+            for idx, opt in enumerate(emp_options):
+                if opt.startswith(curr_emp_label + "|"):
+                    def_idx_emp = idx
+                    break
+                    
+            selected_emp_opt = st.selectbox(
+                "Selecciona la Empresa:", 
+                options=emp_options, 
+                index=def_idx_emp,
+                format_func=lambda x: x.split("|")[0] if "|" in x else x,
+                key="select_empresa_widget"
+            )
+            
+            # Formulario para crear una nueva etiqueta de Empresa
+            with st.expander("➕ Crear nueva etiqueta de Empresa"):
+                new_emp_name = st.text_input("Nombre de la nueva empresa:", key="new_emp_name_input")
+                if st.button("Crear Término", key="create_term_btn_widget"):
+                    if not new_emp_name.strip():
+                        st.error("Por favor, introduce un nombre válido.")
+                    else:
+                        with st.spinner("Creando término en SharePoint..."):
+                            try:
+                                res_new_term = requests.post(f"{backend_url}/api/taxonomy/empresa/terms", json={"name": new_emp_name.strip()})
+                                if res_new_term.status_code == 200:
+                                    st.success(f"Empresa '{new_emp_name}' creada con éxito en el TermStore.")
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                else:
+                                    st.error(f"Error creando término: {res_new_term.text}")
+                            except Exception as ex:
+                                st.error(f"Excepción: {ex}")
+                                
+        st.write("")
+        if st.button("💾 Guardar Etiquetas de Metadatos", use_container_width=True, key="save_tags_btn_widget"):
+            area_val = None if selected_area_opt == "-- Sin Asignar --" else selected_area_opt
+            emp_val = None if selected_emp_opt == "-- Sin Asignar --" else selected_emp_opt
+            
+            with st.spinner("Guardando etiquetas..."):
+                try:
+                    res_save = requests.post(
+                        f"{backend_url}/api/pdfs/{pdf_item['id']}/tags",
+                        json={"area_tag": area_val, "empresa_tag": emp_val}
+                    )
+                    if res_save.status_code == 200:
+                        save_data = res_save.json()
+                        if save_data.get("sp_updated"):
+                            st.success("¡Etiquetas guardadas con éxito en Base de Datos y en SharePoint!")
+                        else:
+                            st.warning(f"Etiquetas guardadas localmente. Nota: {save_data.get('sp_error')}")
+                        st.cache_data.clear()
+                        import time
+                        time.sleep(1.5)
+                        st.rerun()
+                    else:
+                        st.error(f"Error guardando etiquetas: {res_save.text}")
+                except Exception as e_save:
+                    st.error(f"Excepción al guardar: {e_save}")

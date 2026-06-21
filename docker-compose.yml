@@ -21,6 +21,8 @@ services:
       CLIENT_SECRET: ${CLIENT_SECRET}
       SHAREPOINT_SITE_URL: ${SHAREPOINT_SITE_URL}
       SHAREPOINT_SITE_ID: ${SHAREPOINT_SITE_ID}
+      TERM_SET_AREA_ID: ${TERM_SET_AREA_ID}
+      TERM_SET_EMPRESA_ID: ${TERM_SET_EMPRESA_ID}
   frontend:
     build:
       context: ./frontend
