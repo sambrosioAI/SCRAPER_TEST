@@ -16,6 +16,7 @@ import re
 import random
 import asyncio
 from urllib.parse import urlparse
+from crawlee import ConcurrencySettings
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
 app = FastAPI(title="Merlin Scraper Backend")
@@ -759,56 +760,87 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
         page = await context.new_page()
         page.set_default_timeout(90000) # 90 segundos de margen
         
-        print(f"Iniciando navegación cautelosa a: {target_url}")
-        try:
-            await page.goto(target_url, wait_until="networkidle", timeout=90000)
-        except Exception as e:
-            await browser.close()
-            error_msg = str(e)
-            # Extraer el nombre del dominio para el mensaje
-            domain = urlparse(target_url).netloc.replace("www.", "").split(".")[0].capitalize()
-            
-            if "ERR_CONNECTION_REFUSED" in error_msg or "ERR_CONNECTION_CLOSED" in error_msg:
-                raise Exception(f"⚠️ La web de destino ({domain}) ha rechazado la conexión. Es posible que nos hayan bloqueado temporalmente. Por favor, espera 15-30 minutos.")
-            elif "Timeout" in error_msg:
-                raise Exception(f"⚠️ La web {domain} está tardando demasiado en responder. Por favor, inténtalo más tarde.")
-            else:
-                raise Exception(f"⚠️ Error al acceder a {domain}: {error_msg}")
-        
-        # Pausa inicial humana
-        await asyncio.sleep(random.uniform(2, 4))
-        
-        # --- DESPLEGAR ACORDEONES (Años) con pausas aleatorias ---
-        years = [str(y) for y in range(2026, 2013, -1)]
-        for year in years:
-            try:
-                # Buscar texto del año en botones o enlaces
-                el = page.get_by_role("button", name=year, exact=False).or_(page.get_by_text(year, exact=True))
-                if await el.count() > 0:
-                    await el.first.click(force=True)
-                    print(f"Desplegando año {year}...")
-                    await asyncio.sleep(random.uniform(1.5, 3.5)) # Pausa aleatoria entre clics
-            except:
-                continue
-                    
-        await page.wait_for_timeout(3000)
-        
-        # Extract Links
-        all_links = await page.locator("a").all()
-        target_pdfs = []
         parsed_target = urlparse(target_url)
+        urls_to_scrape = [target_url]
+        
+        # --- DETECCIÃ“N Y EXPANSIÃ“N ESTÃNDAR DE VARIABLES DE AÃ‘O EN LA URL ---
+        from urllib.parse import parse_qs, urlencode
+        query_params = parse_qs(parsed_target.query)
+        year_param_key = None
+        
+        # 1. Buscar si hay algÃºn parÃ¡metro de consulta cuyo valor sea un aÃ±o (ej. 2000-2030)
+        for key, values in query_params.items():
+            for val in values:
+                if val.isdigit() and len(val) == 4 and 2000 <= int(val) <= 2030:
+                    year_param_key = key
+                    break
+            if year_param_key:
+                break
+        
+        # 2. Si no se detectÃ³ por valor, pero el dominio es gecina.fr, forzamos el parÃ¡metro 'year'
+        if not year_param_key and "gecina.fr" in parsed_target.netloc:
+            year_param_key = 'year'
+            
+        # 3. Si encontramos un parÃ¡metro de aÃ±o, expandimos las URLs
+        if year_param_key:
+            urls_to_scrape = []
+            current_year = datetime.now().year
+            for y in range(current_year, 2013, -1):
+                query_params[year_param_key] = [str(y)]
+                new_query = urlencode(query_params, doseq=True)
+                new_url = parsed_target._replace(query=new_query).geturl()
+                urls_to_scrape.append(new_url)
+            print(f"[*] Expandidas URLs de rastreo para {len(urls_to_scrape)} aÃ±os usando el parÃ¡metro '{year_param_key}'.", flush=True)
+        target_pdfs = []
         base_domain = f"{parsed_target.scheme}://{parsed_target.netloc}"
-        
-        for link in all_links:
+
+        for idx, url in enumerate(urls_to_scrape):
+            print(f"[{idx+1}/{len(urls_to_scrape)}] Iniciando navegaciÃ³n cautelosa a: {url}")
             try:
-                href = await link.get_attribute("href")
-                if href and ".pdf" in href.lower():
-                    if not href.startswith("http"):
-                        href = f"{base_domain}{href}" if href.startswith("/") else f"{base_domain}/{href}"
-                    target_pdfs.append(href)
-            except:
-                continue
-        
+                await page.goto(url, wait_until="networkidle", timeout=90000)
+            except Exception as e:
+                print(f"Error al acceder a {url}: {e}. Continuando...")
+                if len(urls_to_scrape) == 1:
+                    await browser.close()
+                    error_msg = str(e)
+                    domain = parsed_target.netloc.replace("www.", "").split(".")[0].capitalize()
+                    if "ERR_CONNECTION_REFUSED" in error_msg or "ERR_CONNECTION_CLOSED" in error_msg:
+                        raise Exception(f"âš ï¸ La web de destino ({domain}) ha rechazado la conexiÃ³n. Es posible que nos hayan bloqueado temporalmente. Por favor, espera 15-30 minutos.")
+                    elif "Timeout" in error_msg:
+                        raise Exception(f"âš ï¸ La web {domain} estÃ¡ tardando demasiado en responder. Por favor, intÃ©ntalo mÃ¡s tarde.")
+                    else:
+                        raise Exception(f"âš ï¸ Error al acceder a {domain}: {error_msg}")
+                else:
+                    continue
+
+            # Pausa inicial humana
+            await asyncio.sleep(random.uniform(2, 4))
+            
+            # --- DESPLEGAR ACORDEONES (AÃ±os) con pausas aleatorias (solo si no es Gecina) ---
+            if "gecina.fr" not in parsed_target.netloc:
+                years = [str(y) for y in range(2026, 2013, -1)]
+                for year in years:
+                    try:
+                        el = page.get_by_role("button", name=year, exact=False).or_(page.get_by_text(year, exact=True))
+                        if await el.count() > 0:
+                            await el.first.click(force=True)
+                            print(f"Desplegando aÃ±o {year}...")
+                            await asyncio.sleep(random.uniform(1.5, 3.5))
+                    except:
+                        continue
+                await page.wait_for_timeout(3000)
+            
+            # Extract Links de esta pÃ¡gina
+            all_links = await page.locator("a").all()
+            for link in all_links:
+                try:
+                    href = await link.get_attribute("href")
+                    if href and ".pdf" in href.lower():
+                        if not href.startswith("http"):
+                            href = f"{base_domain}{href}" if href.startswith("/") else f"{base_domain}/{href}"
+                        target_pdfs.append(href)
+                except:
+                    continue
         # --- FALLBACK CRAWLEE (Potenciado) ---
         if len(target_pdfs) < 5: # Si el método nativo falla o encuentra muy poco
             print(f"Activando Rastreo Profundo con Crawlee (Encontrados nativos: {len(target_pdfs)})...")
@@ -816,9 +848,14 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
             
             # Configuramos el crawler para que sea más persistente
             crawler = PlaywrightCrawler(
-                max_concurrency=1, # Muy lento para evitar ERR_CONNECTION_REFUSED
+                concurrency_settings=ConcurrencySettings(
+                    max_concurrency=1,
+                    min_concurrency=1,
+                    desired_concurrency=1
+                ),
+# max_concurrency parameter removed
                 headless=True,
-                playwright_launch_options={"slow_mo": 2000},
+                browser_launch_options={"slow_mo": 2000},
             )
             
             @crawler.router.default_handler
@@ -844,7 +881,7 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                 if "merlin" in target_url:
                     await ctx.enqueue_links(regex=r"https://ir\.merlinproperties\.com/.*")
 
-            await crawler.run([target_url])
+            await crawler.run(urls_to_scrape)
             target_pdfs.extend(crawlee_pdfs)
             target_pdfs = list(set(target_pdfs)) # Limpiar duplicados de URLs
 
