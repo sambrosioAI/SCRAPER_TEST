@@ -200,6 +200,17 @@ class ScrapedTarget(Base):
     target_url = Column(String, unique=True, index=True, nullable=False)
     last_scraped_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     total_pdfs_found = Column(Integer, default=0)
+    area_tag = Column(String, nullable=True)
+    empresa_tag = Column(String, nullable=True)
+
+class SchedulerSettings(Base):
+    __tablename__ = "scheduler_settings"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    enabled = Column(Integer, default=1)  # 1 = enabled, 0 = disabled
+    day_of_week = Column(String, default="Monday")  # "Monday", "Tuesday", etc.
+    time_of_day = Column(String, default="02:00")  # "HH:MM" format (24h)
+    last_run_date = Column(DateTime, nullable=True)  # Last time the scheduler ran
 
 async def sync_missing_metadata():
     """
@@ -293,6 +304,73 @@ async def sync_missing_metadata():
             traceback.print_exc()
             print(f"[Sync] Error durante la sincronización: {e}", flush=True)
 
+async def init_scheduler_settings():
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(SchedulerSettings))
+        settings = res.scalars().first()
+        if not settings:
+            session.add(SchedulerSettings(
+                enabled=1,
+                day_of_week="Monday",
+                time_of_day="02:00"
+            ))
+            await session.commit()
+
+async def run_scheduler_bulk_scrape():
+    print("[Scheduler] Iniciando actualización en lote semanal...", flush=True)
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(ScrapedTarget))
+            targets = result.scalars().all()
+            urls = [t.target_url for t in targets]
+            
+        total_downloaded = 0
+        for url in urls:
+            try:
+                print(f"[Scheduler] Automatización semanal: actualizando {url}", flush=True)
+                res = await run_merlin_scraper(url)
+                total_downloaded += res.get("downloaded_count", 0)
+                asyncio.create_task(verify_and_fix_tags_for_target(url))
+            except Exception as e:
+                print(f"[Scheduler] Error actualizando {url}: {e}", flush=True)
+        print(f"[Scheduler] Actualización en lote semanal completada. Total PDFs descargados: {total_downloaded}", flush=True)
+    except Exception as e:
+        print(f"[Scheduler] Error en actualización en lote del programador: {e}", flush=True)
+
+async def weekly_scheduler_loop():
+    print("[Scheduler] Bucle del programador semanal iniciado.", flush=True)
+    await asyncio.sleep(10) # Espera inicial tras arranque
+    
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(select(SchedulerSettings))
+                settings = res.scalars().first()
+                
+                if settings and settings.enabled == 1:
+                    now = datetime.now()
+                    current_day = now.strftime("%A") # "Monday", "Tuesday", etc.
+                    current_time_str = now.strftime("%H:%M") # "HH:MM"
+                    
+                    if current_day.lower() == settings.day_of_week.lower() and current_time_str == settings.time_of_day:
+                        should_run = True
+                        if settings.last_run_date:
+                            time_since_last_run = now - settings.last_run_date
+                            if time_since_last_run.total_seconds() < 43200: # 12 horas
+                                should_run = False
+                        
+                        if should_run:
+                            print(f"[Scheduler] Lanzando actualización semanal programada. Día: {current_day}, Hora: {current_time_str}", flush=True)
+                            settings.last_run_date = now
+                            await session.commit()
+                            sync_db_to_sp()
+                            asyncio.create_task(run_scheduler_bulk_scrape())
+                            
+        except Exception as e:
+            print(f"[Scheduler] Error en bucle del programador: {e}", flush=True)
+            
+        await asyncio.sleep(60) # comprobar cada minuto
+
 # Create tables if not exist
 @app.on_event("startup")
 async def startup():
@@ -319,6 +397,7 @@ async def startup():
         
         # Migración dinámica: añadir nuevas columnas si no existen
         try:
+            # 1. Migración para scraped_pdfs
             res = await conn.execute(text("PRAGMA table_info(scraped_pdfs);"))
             existing_cols = [row[1] for row in res.fetchall()]
             new_cols = {
@@ -332,11 +411,30 @@ async def startup():
                 if col_name not in existing_cols:
                     print(f"Migrando BD: Añadiendo columna {col_name} a scraped_pdfs", flush=True)
                     await conn.execute(text(f"ALTER TABLE scraped_pdfs ADD COLUMN {col_name} {col_type};"))
+
+            # 2. Migración para scraped_targets
+            res_target = await conn.execute(text("PRAGMA table_info(scraped_targets);"))
+            existing_target_cols = [row[1] for row in res_target.fetchall()]
+            new_target_cols = {
+                "area_tag": "TEXT",
+                "empresa_tag": "TEXT"
+            }
+            for col_name, col_type in new_target_cols.items():
+                if col_name not in existing_target_cols:
+                    print(f"Migrando BD: Añadiendo columna {col_name} a scraped_targets", flush=True)
+                    await conn.execute(text(f"ALTER TABLE scraped_targets ADD COLUMN {col_name} {col_type};"))
         except Exception as e:
             print(f"Error ejecutando migración: {e}", flush=True)
             
-    # Lanzar la tarea de sincronización de metadatos en segundo plano
+    # Inicializar configuraciones por defecto del scheduler si no existen
+    try:
+        await init_scheduler_settings()
+    except Exception as e:
+        print(f"Error inicializando scheduler settings: {e}", flush=True)
+
+    # Lanzar la tarea de sincronización de metadatos y el programador semanal en segundo plano
     asyncio.create_task(sync_missing_metadata())
+    asyncio.create_task(weekly_scheduler_loop())
 
 # --- Pydantic Schemas ---
 
@@ -641,6 +739,31 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
     downloaded = 0
     skipped = 0
     failed_files: list = []  # Tracks files that failed after all retries
+
+    # Recuperación de etiquetas de la base de datos si no vienen especificadas (ej. al re-rastrear o desde scheduler)
+    if not area_tag or not empresa_tag:
+        async with AsyncSessionLocal() as session:
+            res_t = await session.execute(select(ScrapedTarget).filter(ScrapedTarget.target_url == target_url))
+            target_obj = res_t.scalars().first()
+            if target_obj:
+                if not area_tag and target_obj.area_tag:
+                    area_tag = target_obj.area_tag
+                if not empresa_tag and target_obj.empresa_tag:
+                    empresa_tag = target_obj.empresa_tag
+            
+            if not area_tag or not empresa_tag:
+                res_p = await session.execute(
+                    select(ScrapedPDF).filter(
+                        ScrapedPDF.parent_target_url == target_url,
+                        (ScrapedPDF.area_tag != None) | (ScrapedPDF.empresa_tag != None)
+                    ).order_by(ScrapedPDF.download_date.desc()).limit(1)
+                )
+                existing_pdf = res_p.scalars().first()
+                if existing_pdf:
+                    if not area_tag:
+                        area_tag = existing_pdf.area_tag
+                    if not empresa_tag:
+                        empresa_tag = existing_pdf.empresa_tag
     
     # 1. Validación Directa: Si es un PDF suelto, evitamos Playwright
     if target_url.lower().strip().endswith(".pdf"):
@@ -735,8 +858,17 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
             if existing_target:
                 existing_target.last_scraped_date = datetime.utcnow()
                 existing_target.total_pdfs_found += downloaded
+                if area_tag:
+                    existing_target.area_tag = area_tag
+                if empresa_tag:
+                    existing_target.empresa_tag = empresa_tag
             else:
-                session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=downloaded))
+                session.add(ScrapedTarget(
+                    target_url=target_url,
+                    total_pdfs_found=downloaded,
+                    area_tag=area_tag,
+                    empresa_tag=empresa_tag
+                ))
             await session.commit()
 
         sync_db_to_sp()
@@ -997,8 +1129,17 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
             if target_obj:
                 target_obj.last_scraped_date = datetime.utcnow()
                 target_obj.total_pdfs_found = real_count
+                if area_tag:
+                    target_obj.area_tag = area_tag
+                if empresa_tag:
+                    target_obj.empresa_tag = empresa_tag
             else:
-                session.add(ScrapedTarget(target_url=target_url, total_pdfs_found=real_count))
+                session.add(ScrapedTarget(
+                    target_url=target_url,
+                    total_pdfs_found=real_count,
+                    area_tag=area_tag,
+                    empresa_tag=empresa_tag
+                ))
             
             await session.commit()
 
@@ -1221,5 +1362,80 @@ async def tag_pdf(pdf_id: int, req: TagPDFRequest):
             "sp_updated": sp_error is None,
             "sp_error": sp_error
         }
+
+# --- Scheduler API Endpoints ---
+
+class SchedulerSettingsResponse(BaseModel):
+    enabled: bool
+    day_of_week: str
+    time_of_day: str
+    last_run_date: Optional[datetime] = None
+    server_time: str
+
+    class Config:
+        from_attributes = True
+
+class UpdateSchedulerSettingsRequest(BaseModel):
+    enabled: Optional[bool] = None
+    day_of_week: Optional[str] = None
+    time_of_day: Optional[str] = None
+
+@app.get("/api/scheduler", response_model=SchedulerSettingsResponse)
+async def get_scheduler_settings():
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(SchedulerSettings))
+        settings = res.scalars().first()
+        if not settings:
+            settings = SchedulerSettings(enabled=1, day_of_week="Monday", time_of_day="02:00")
+            session.add(settings)
+            await session.commit()
+            await session.refresh(settings)
+        
+        now = datetime.now()
+        server_time_str = now.strftime("%A, %H:%M:%S (local)")
+        
+        return SchedulerSettingsResponse(
+            enabled=bool(settings.enabled),
+            day_of_week=settings.day_of_week,
+            time_of_day=settings.time_of_day,
+            last_run_date=settings.last_run_date,
+            server_time=server_time_str
+        )
+
+@app.patch("/api/scheduler", response_model=SchedulerSettingsResponse)
+async def update_scheduler_settings(req: UpdateSchedulerSettingsRequest):
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(SchedulerSettings))
+        settings = res.scalars().first()
+        if not settings:
+            settings = SchedulerSettings(enabled=1, day_of_week="Monday", time_of_day="02:00")
+            session.add(settings)
+            await session.commit()
+            await session.refresh(settings)
+        
+        if req.enabled is not None:
+            settings.enabled = 1 if req.enabled else 0
+        if req.day_of_week is not None:
+            settings.day_of_week = req.day_of_week
+        if req.time_of_day is not None:
+            if not re.match(r"^\d{2}:\d{2}$", req.time_of_day):
+                raise HTTPException(status_code=400, detail="El formato de hora debe ser HH:MM")
+            settings.time_of_day = req.time_of_day
+            
+        await session.commit()
+        await session.refresh(settings)
+        
+        sync_db_to_sp()
+        
+        now = datetime.now()
+        server_time_str = now.strftime("%A, %H:%M:%S (local)")
+        
+        return SchedulerSettingsResponse(
+            enabled=bool(settings.enabled),
+            day_of_week=settings.day_of_week,
+            time_of_day=settings.time_of_day,
+            last_run_date=settings.last_run_date,
+            server_time=server_time_str
+        )
 
 

@@ -70,6 +70,16 @@ def get_targets():
         pass
     return []
 
+@st.cache_data(ttl=2)
+def get_scheduler_settings():
+    try:
+        response = requests.get(f"{backend_url}/api/scheduler")
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
 # --- Base de Web Scraping ---
 col1, col2 = st.columns([1, 1])
 
@@ -256,7 +266,58 @@ with col2:
                         st.error(f"Error Bulk: {res_all.status_code}")
                 except Exception as e:
                     st.error(e)
-
+        
+    st.write("")
+    st.subheader("⏰ Programación Semanal")
+    
+    sched = get_scheduler_settings()
+    if sched:
+        status_text = "🟢 Activo" if sched["enabled"] else "🔴 Desactivado"
+        st.markdown(f"**Estado:** {status_text} &nbsp;&nbsp;|&nbsp;&nbsp; **Día:** `{sched['day_of_week']}` &nbsp;&nbsp;|&nbsp;&nbsp; **Hora:** `{sched['time_of_day']}`")
+        if sched.get("last_run_date"):
+            last_run = pd.to_datetime(sched["last_run_date"]).strftime("%Y-%m-%d %H:%M")
+            st.markdown(f"**Última ejecución:** {last_run}")
+        st.caption(f"_{sched['server_time']}_")
+        
+        with st.expander("⚙️ Modificar Programación"):
+            enabled_input = st.checkbox("Habilitar actualización automática semanal", value=sched["enabled"])
+            
+            days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            days_es = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+            day_map = dict(zip(days, days_es))
+            day_map_rev = dict(zip(days_es, days))
+            
+            curr_day_es = day_map.get(sched["day_of_week"], sched["day_of_week"])
+            selected_day_es = st.selectbox("Día de la semana:", options=days_es, index=days_es.index(curr_day_es) if curr_day_es in days_es else 0)
+            selected_day = day_map_rev[selected_day_es]
+            
+            time_val = sched["time_of_day"] # "HH:MM"
+            time_input = st.text_input("Hora de ejecución (Formato HH:MM, 24h):", value=time_val)
+            
+            if st.button("Guardar Configuración"):
+                import re
+                if not re.match(r"^\d{2}:\d{2}$", time_input):
+                    st.error("Formato de hora incorrecto. Usa HH:MM (ej. 02:00)")
+                else:
+                    try:
+                        res_patch = requests.patch(
+                            f"{backend_url}/api/scheduler",
+                            json={
+                                "enabled": enabled_input,
+                                "day_of_week": selected_day,
+                                "time_of_day": time_input
+                            }
+                        )
+                        if res_patch.status_code == 200:
+                            st.success("¡Configuración guardada!")
+                            st.cache_data.clear()
+                            import time
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error(f"Error al guardar: {res_patch.text}")
+                    except Exception as ex:
+                        st.error(f"Error de conexión: {ex}")
 
 st.divider()
 
