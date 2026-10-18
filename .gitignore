@@ -6,3 +6,4 @@ data/pdfs/
 *.db
 scratch/
 backend/audit_script.py
+.vscode/
