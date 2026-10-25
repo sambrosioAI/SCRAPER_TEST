@@ -15,7 +15,7 @@ import httpx
 import re
 import random
 import asyncio
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, parse_qs, urlencode
 from crawlee import ConcurrencySettings
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
@@ -922,57 +922,99 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                 new_query = urlencode(query_params, doseq=True)
                 new_url = parsed_target._replace(query=new_query).geturl()
                 urls_to_scrape.append(new_url)
-            print(f"[*] Expandidas URLs de rastreo para {len(urls_to_scrape)} aÃ±os usando el parÃ¡metro '{year_param_key}'.", flush=True)
+            print(f"[*] Expandidas URLs de rastreo para {len(urls_to_scrape)} años usando el parámetro '{year_param_key}'.", flush=True)
         target_pdfs = []
         base_domain = f"{parsed_target.scheme}://{parsed_target.netloc}"
 
-        for idx, url in enumerate(urls_to_scrape):
-            print(f"[{idx+1}/{len(urls_to_scrape)}] Iniciando navegaciÃ³n cautelosa a: {url}")
+        # Cola dinámica para procesar URLs de inicio y las páginas adicionales descubiertas por paginación
+        urls_to_process = list(urls_to_scrape)
+        visited_scrape_urls = set()
+        pages_processed = 0
+        MAX_PAGES_TO_SCRAPE = 40  # Límite seguro para evitar bucles infinitos en webs muy extensas
+
+        while urls_to_process and pages_processed < MAX_PAGES_TO_SCRAPE:
+            url = urls_to_process.pop(0)
+            if url in visited_scrape_urls:
+                continue
+            visited_scrape_urls.add(url)
+            pages_processed += 1
+
+            print(f"[{pages_processed}/{pages_processed + len(urls_to_process)}] Iniciando navegación cautelosa a: {url}")
             try:
                 await page.goto(url, wait_until="networkidle", timeout=90000)
             except Exception as e:
                 print(f"Error al acceder a {url}: {e}. Continuando...")
-                if len(urls_to_scrape) == 1:
+                if pages_processed == 1 and not urls_to_process:
                     await browser.close()
                     error_msg = str(e)
                     domain = parsed_target.netloc.replace("www.", "").split(".")[0].capitalize()
                     if "ERR_CONNECTION_REFUSED" in error_msg or "ERR_CONNECTION_CLOSED" in error_msg:
-                        raise Exception(f"âš ï¸ La web de destino ({domain}) ha rechazado la conexiÃ³n. Es posible que nos hayan bloqueado temporalmente. Por favor, espera 15-30 minutos.")
+                        raise Exception(f"⚠️ La web de destino ({domain}) ha rechazado la conexión. Es posible que nos hayan bloqueado temporalmente. Por favor, espera 15-30 minutos.")
                     elif "Timeout" in error_msg:
-                        raise Exception(f"âš ï¸ La web {domain} estÃ¡ tardando demasiado en responder. Por favor, intÃ©ntalo mÃ¡s tarde.")
+                        raise Exception(f"⚠️ La web {domain} está tardando demasiado en responder. Por favor, inténtalo más tarde.")
                     else:
-                        raise Exception(f"âš ï¸ Error al acceder a {domain}: {error_msg}")
+                        raise Exception(f"⚠️ Error al acceder a {domain}: {error_msg}")
                 else:
                     continue
 
             # Pausa inicial humana
             await asyncio.sleep(random.uniform(2, 4))
             
-            # --- DESPLEGAR ACORDEONES (AÃ±os) con pausas aleatorias (solo si no es Gecina) ---
+            # --- DESPLEGAR ACORDEONES (Años) con pausas aleatorias (solo si no es Gecina) ---
             if "gecina.fr" not in parsed_target.netloc:
                 years = [str(y) for y in range(2026, 2013, -1)]
+                clicked_any = False
                 for year in years:
                     try:
                         el = page.get_by_role("button", name=year, exact=False).or_(page.get_by_text(year, exact=True))
                         if await el.count() > 0:
                             await el.first.click(force=True)
-                            print(f"Desplegando aÃ±o {year}...")
+                            clicked_any = True
+                            print(f"Desplegando año {year}...")
                             await asyncio.sleep(random.uniform(1.5, 3.5))
                     except:
                         continue
-                await page.wait_for_timeout(3000)
+                if clicked_any:
+                    await page.wait_for_timeout(3000)
             
-            # Extract Links de esta pÃ¡gina
+            # Extract Links de esta página
             all_links = await page.locator("a").all()
             for link in all_links:
                 try:
                     href = await link.get_attribute("href")
                     if href and ".pdf" in href.lower():
                         if not href.startswith("http"):
-                            href = f"{base_domain}{href}" if href.startswith("/") else f"{base_domain}/{href}"
+                            href = urljoin(url, href)
                         target_pdfs.append(href)
                 except:
                     continue
+
+            # --- DETECCIÓN DINÁMICA DE PAGINACIÓN (ej. Icade y webs paginadas) ---
+            pagination_selectors = [
+                ".pagination a[href]",
+                "ul.pagination-pages a[href]",
+                "ul.pagination a[href]",
+                "nav[aria-label*='pagination' i] a[href]",
+                ".pager a[href]",
+                "a.page-link[href]",
+                "a[rel='next'][href]",
+            ]
+            for sel in pagination_selectors:
+                try:
+                    pag_elements = await page.locator(sel).all()
+                    for pel in pag_elements:
+                        p_href = await pel.get_attribute("href")
+                        if p_href:
+                            full_pag_url = urljoin(url, p_href)
+                            parsed_pag = urlparse(full_pag_url)
+                            # Asegurar que pertenezca al mismo dominio y mantenga la ruta base de publicaciones
+                            if parsed_pag.netloc == parsed_target.netloc and parsed_pag.path.rstrip('/') == parsed_target.path.rstrip('/'):
+                                if full_pag_url not in visited_scrape_urls and full_pag_url not in urls_to_process:
+                                    urls_to_process.append(full_pag_url)
+                                    print(f"[*] Detectada página adicional de paginación: {full_pag_url}", flush=True)
+                except Exception:
+                    pass
+
         # --- FALLBACK CRAWLEE (Potenciado) ---
         if len(target_pdfs) < 5: # Si el método nativo falla o encuentra muy poco
             print(f"Activando Rastreo Profundo con Crawlee (Encontrados nativos: {len(target_pdfs)})...")
@@ -1004,7 +1046,7 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                     href = await link.get_attribute("href")
                     if href and ".pdf" in href.lower():
                         if not href.startswith("http"):
-                            href = f"{base_domain}{href}" if href.startswith("/") else f"{base_domain}/{href}"
+                            href = urljoin(ctx.request.url, href)
                         crawlee_pdfs.append(href)
                 
                 # Seguir enlaces si estamos en el mismo dominio o subdominio
@@ -1012,8 +1054,12 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                 # Intentar también en subdominios financieros (común en Merlin/Icade)
                 if "merlin" in target_url:
                     await ctx.enqueue_links(regex=r"https://ir\.merlinproperties\.com/.*")
+                # Seguir enlaces de paginación en Crawlee si se presentan
+                await ctx.enqueue_links(
+                    selector=".pagination a[href], ul.pagination-pages a[href], nav[aria-label*='pagination' i] a[href], .pager a[href]"
+                )
 
-            await crawler.run(urls_to_scrape)
+            await crawler.run(list(visited_scrape_urls) if visited_scrape_urls else urls_to_scrape)
             target_pdfs.extend(crawlee_pdfs)
             target_pdfs = list(set(target_pdfs)) # Limpiar duplicados de URLs
 
