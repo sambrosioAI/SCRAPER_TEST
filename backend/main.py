@@ -12,10 +12,12 @@ from sqlalchemy.future import select
 from sqlalchemy import text
 from playwright.async_api import async_playwright
 import httpx
+import io
+import zipfile
 import re
 import random
 import asyncio
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode
+from urllib.parse import urlparse, urljoin, parse_qs, urlencode, unquote
 from crawlee import ConcurrencySettings
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
@@ -733,6 +735,60 @@ async def verify_and_fix_tags_for_target(target_url: str):
         print(f"[Verify] Error general en verificación: {e}", flush=True)
 
 
+# --- URL & Pagination Helpers ---
+
+def merge_pagination_url(base_url: str, pag_href: str) -> Optional[str]:
+    """
+    Safely joins a pagination link href with a base URL, preserving existing
+    query parameters (such as filters, categories, etc.) when the href only specifies
+    pagination parameters (e.g. ?page=2 or ?fwp_paged=2).
+    """
+    if not pag_href or pag_href.startswith("javascript:") or pag_href == "#":
+        return None
+        
+    full_url = urljoin(base_url, pag_href)
+    parsed_base = urlparse(base_url)
+    parsed_full = urlparse(full_url)
+    
+    # If the relative href starts with '?' or specifies query parameters, merge them
+    if "?" in pag_href or parsed_full.path == parsed_base.path:
+        base_params = parse_qs(parsed_base.query)
+        new_params = parse_qs(parsed_full.query)
+        merged_params = {}
+        for k, v in base_params.items():
+            merged_params[k] = v
+        for k, v in new_params.items():
+            merged_params[k] = v
+        new_query = urlencode(merged_params, doseq=True)
+        return parsed_full._replace(query=new_query, fragment="").geturl()
+        
+    return parsed_full._replace(fragment="").geturl()
+
+
+def extract_filename_from_cd(cd_header: Optional[str]) -> Optional[str]:
+    """
+    Extracts and decodes a filename from an HTTP Content-Disposition header
+    (supporting both RFC 5987 filename*=UTF-8''... and standard filename="...").
+    """
+    if not cd_header:
+        return None
+    # 1. Try filename*=utf-8''...
+    m_star = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)", cd_header)
+    if m_star:
+        fname = unquote(m_star.group(1).strip().strip('"').strip("'"))
+        if fname:
+            return fname if fname.lower().endswith(".pdf") else f"{fname}.pdf"
+    # 2. Try standard filename="..."
+    m_std = re.search(r'filename\s*=\s*"([^"]+)"', cd_header)
+    if not m_std:
+        m_std = re.search(r"filename\s*=\s*([^;\s\r\n]+)", cd_header)
+    if m_std:
+        fname = unquote(m_std.group(1).strip().strip('"').strip("'"))
+        if fname and "." in fname:
+            return fname if fname.lower().endswith(".pdf") else f"{fname}.pdf"
+    return None
+
+
 # --- Scraper Logic ---
 
 async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, empresa_tag: Optional[str] = None) -> dict:
@@ -960,8 +1016,8 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
             # Pausa inicial humana
             await asyncio.sleep(random.uniform(2, 4))
             
-            # --- DESPLEGAR ACORDEONES (Años) con pausas aleatorias (solo si no es Gecina) ---
-            if "gecina.fr" not in parsed_target.netloc:
+            # --- DESPLEGAR ACORDEONES (Años) con pausas aleatorias (solo si no es Gecina, URW, Covivio, Vonovia o Klépierre) ---
+            if not any(d in parsed_target.netloc for d in ("gecina.fr", "urw.com", "covivio.eu", "vonovia.com", "klepierre.com")):
                 years = [str(y) for y in range(2026, 2013, -1)]
                 clicked_any = False
                 for year in years:
@@ -976,6 +1032,157 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                         continue
                 if clicked_any:
                     await page.wait_for_timeout(3000)
+
+            # --- EXPANSIÓN ACUMULATIVA DE PAGINACIÓN: URW (Botón "Load more" con parámetro page= y código ts=) ---
+            if "urw.com" in parsed_target.netloc:
+                print("[*] Detectado dominio URW: desplegando todas las páginas mediante 'Load more'...", flush=True)
+                load_more_clicks = 0
+                MAX_LOAD_MORE_CLICKS = 40
+                while load_more_clicks < MAX_LOAD_MORE_CLICKS:
+                    try:
+                        load_more_btn = page.locator("a, button").filter(has_text=re.compile(r"load more", re.I))
+                        if await load_more_btn.count() == 0 or not await load_more_btn.first.is_visible():
+                            print(f"[*] URW: Botón 'Load more' completado tras {load_more_clicks} pulsaciones. Todos los documentos cargados en el DOM.", flush=True)
+                            break
+                        next_href = await load_more_btn.first.get_attribute("href")
+                        load_more_clicks += 1
+                        print(f"[*] URW [Paso {load_more_clicks}]: Cargando siguiente página ({next_href})...", flush=True)
+                        await load_more_btn.first.scroll_into_view_if_needed()
+                        await load_more_btn.first.click(force=True)
+                        await page.wait_for_timeout(3500)
+                    except Exception as e:
+                        print(f"[*] URW: Fin de paginación 'Load more' ({e})", flush=True)
+                        break
+
+            # --- EXPANSIÓN ACUMULATIVA: VONOVIA (Botón "Load more" + descargas directas /content/download/) ---
+            if "vonovia.com" in parsed_target.netloc:
+                print("[*] Detectado dominio Vonovia: desplegando la totalidad de resultados mediante 'Load more'...", flush=True)
+                try:
+                    cookie_btn = page.locator("#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, #CybotCookiebotDialogBodyButtonAccept")
+                    if await cookie_btn.count() > 0 and await cookie_btn.first.is_visible():
+                        await cookie_btn.first.click(timeout=3000)
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+                vonovia_clicks = 0
+                MAX_VONOVIA_CLICKS = 65
+                while vonovia_clicks < MAX_VONOVIA_CLICKS:
+                    try:
+                        v_btn = page.locator("button.ir-results-load-more-btn, button:has-text('Load more')")
+                        if await v_btn.count() == 0 or not await v_btn.first.is_visible():
+                            print(f"[*] Vonovia: Botón 'Load more' completado tras {vonovia_clicks} pulsaciones.", flush=True)
+                            break
+                        vonovia_clicks += 1
+                        if vonovia_clicks % 5 == 1 or vonovia_clicks == 1:
+                            print(f"[*] Vonovia [Paso {vonovia_clicks}]: Pulsando 'Load more'...", flush=True)
+                        await v_btn.first.scroll_into_view_if_needed()
+                        await v_btn.first.click(force=True)
+                        await page.wait_for_timeout(1500)
+                    except Exception as e:
+                        print(f"[*] Vonovia: Fin de expansión 'Load more' ({e})", flush=True)
+                        break
+
+                # Extraer enlaces de descarga directa (/content/download/...) que no tienen extensión .pdf explícita en la URL
+                try:
+                    vonovia_extra_urls = await page.evaluate('''() => {
+                        const detailLinks = Array.from(document.querySelectorAll('a.detail-download-link[href]'));
+                        const detailIds = new Set(detailLinks.map(d => {
+                            const m = d.href.match(/\\/content\\/download\\/(\\d+)\\//);
+                            return m ? m[1] : null;
+                        }).filter(Boolean));
+                        const extras = [];
+                        document.querySelectorAll('a.entry-download[href*="/content/download/"]').forEach(a => {
+                            const m = a.href.match(/\\/content\\/download\\/(\\d+)\\//);
+                            const id = m ? m[1] : null;
+                            const card = a.closest('.ir-results-entry, .ir-results-item, tr, li');
+                            const hasDetailsInCard = card ? card.querySelectorAll('a.detail-download-link').length > 0 : false;
+                            if (!hasDetailsInCard || (id && !detailIds.has(id))) {
+                                extras.push(a.href);
+                            }
+                        });
+                        return extras;
+                    }''')
+                    for v_url in vonovia_extra_urls:
+                        target_pdfs.append(v_url)
+                    print(f"[*] Vonovia: Añadidos {len(vonovia_extra_urls)} enlaces de descarga directa (/content/download/).", flush=True)
+                except Exception as e:
+                    print(f"[*] Advertencia extrayendo enlaces adicionales de Vonovia: {e}", flush=True)
+
+            # --- EXPANSIÓN DE ARCHIVOS E HISTÓRICOS: LANDSEC (Pestañas de rangos de años + paquetes .zip) ---
+            if "landsec.com" in parsed_target.netloc:
+                try:
+                    if "/results-reports/results" in parsed_target.path:
+                        landsec_tabs = await page.evaluate('''() => {
+                            return Array.from(document.querySelectorAll('a[href*="/investors/results-reports/results"]'))
+                                .map(a => a.href)
+                                .filter(h => h && !h.toLowerCase().endsWith('.pdf') && !h.toLowerCase().endsWith('.zip'));
+                        }''')
+                        for l_tab in landsec_tabs:
+                            clean_tab = l_tab.split("#")[0].rstrip("/")
+                            norm_visited = {u.rstrip("/") for u in visited_scrape_urls}
+                            norm_queued = {u.rstrip("/") for u in urls_to_process}
+                            if clean_tab not in norm_visited and clean_tab not in norm_queued:
+                                urls_to_process.append(clean_tab)
+                                print(f"[*] Detectada pestaña histórica adicional en Landsec: {clean_tab}", flush=True)
+
+                    landsec_zips = await page.evaluate('''() => {
+                        return Array.from(document.querySelectorAll('a.download-btn[href$=".zip"], a[href*="content.landsec.com"][href$=".zip"]'))
+                            .map(a => a.href);
+                    }''')
+                    for z_url in landsec_zips:
+                        target_pdfs.append(z_url)
+                    if landsec_zips:
+                        print(f"[*] Landsec: Detectados {len(landsec_zips)} paquetes históricos (.zip) con documentos financieros en {url}", flush=True)
+                except Exception as e:
+                    print(f"[*] Advertencia procesando históricos de Landsec: {e}", flush=True)
+
+            # --- EXPANSIÓN COMPLETA DE PUBLICACIONES: KLÉPIERRE (Enlaces .tenabled + API paginada de informes) ---
+            if "klepierre.com" in parsed_target.netloc:
+                try:
+                    print("[*] Detectado dominio Klépierre: extrayendo publicaciones y consultando histórico completo de informes...", flush=True)
+                    klep_dom_links = await page.evaluate('''() => {
+                        return Array.from(document.querySelectorAll('a.tenabled[href*="/finance/"]'))
+                            .map(a => a.href)
+                            .filter(h => !h.includes('-format-html') && !h.includes('-format-esef'));
+                    }''')
+                    for k_url in klep_dom_links:
+                        target_pdfs.append(k_url)
+
+                    klep_api_key = await page.evaluate('''() => (window.temp && window.temp.apiKey) ? window.temp.apiKey : "c3907f04-54b2-4ccc-94d5-a1a964dc0550"''')
+                    locale_prefix = "fr" if "/fr/" in parsed_target.path else "en"
+                    base_klep_path = f"{base_domain}/{locale_prefix}/finance"
+
+                    # Si la URL apunta al bloque de informes anuales/semestrales o a la página general de publicaciones,
+                    # consultamos todas las páginas del feed 'rapport' en el API interno de Klépierre
+                    klep_api_urls = []
+                    async with httpx.AsyncClient(verify=False, timeout=30.0) as k_client:
+                        for k_page in range(1, 15):
+                            api_endpoint = (
+                                f"{base_domain}/api/1.0/issue?_locale={locale_prefix}"
+                                f"&order%5BpublishedAt%5D=DESC&page={k_page}&tagExclusive=true&tags[]=rapport"
+                            )
+                            k_resp = await k_client.get(
+                                api_endpoint,
+                                headers={"X-AUTH-TOKEN": klep_api_key, "Accept": "application/ld+json", "User-Agent": fake_user_agent}
+                            )
+                            if k_resp.status_code != 200:
+                                break
+                            k_data = k_resp.json()
+                            members = k_data.get("hydra:member", [])
+                            if not members:
+                                break
+                            for m in members:
+                                slug = m.get("slug")
+                                if slug and "-format-html" not in slug and "-format-esef" not in slug:
+                                    klep_api_urls.append(f"{base_klep_path}/{slug}")
+                            if len(klep_api_urls) >= k_data.get("hydra:totalItems", 0):
+                                break
+                    for k_url in klep_api_urls:
+                        target_pdfs.append(k_url)
+                    print(f"[*] Klépierre: {len(klep_dom_links)} enlaces en vista inicial + {len(klep_api_urls)} informes históricos recuperados vía API.", flush=True)
+                except Exception as e:
+                    print(f"[*] Advertencia expandiendo publicaciones de Klépierre: {e}", flush=True)
             
             # Extract Links de esta página
             all_links = await page.locator("a").all()
@@ -989,31 +1196,88 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                 except:
                     continue
 
-            # --- DETECCIÓN DINÁMICA DE PAGINACIÓN (ej. Icade y webs paginadas) ---
-            pagination_selectors = [
-                ".pagination a[href]",
-                "ul.pagination-pages a[href]",
-                "ul.pagination a[href]",
-                "nav[aria-label*='pagination' i] a[href]",
-                ".pager a[href]",
-                "a.page-link[href]",
-                "a[rel='next'][href]",
-            ]
-            for sel in pagination_selectors:
+            # --- DETECCIÓN ESPECÍFICA DE PAGINACIÓN: COVIVIO (FacetWP) ---
+            if "covivio.eu" in parsed_target.netloc:
                 try:
-                    pag_elements = await page.locator(sel).all()
-                    for pel in pag_elements:
-                        p_href = await pel.get_attribute("href")
-                        if p_href:
-                            full_pag_url = urljoin(url, p_href)
-                            parsed_pag = urlparse(full_pag_url)
-                            # Asegurar que pertenezca al mismo dominio y mantenga la ruta base de publicaciones
-                            if parsed_pag.netloc == parsed_target.netloc and parsed_pag.path.rstrip('/') == parsed_target.path.rstrip('/'):
-                                if full_pag_url not in visited_scrape_urls and full_pag_url not in urls_to_process:
-                                    urls_to_process.append(full_pag_url)
-                                    print(f"[*] Detectada página adicional de paginación: {full_pag_url}", flush=True)
-                except Exception:
-                    pass
+                    await page.wait_for_timeout(2000)
+                    discovered_cov_pages = await page.evaluate('''() => {
+                        const pages = new Set();
+                        // 1. Elementos con atributo data-page (FacetWP pager)
+                        document.querySelectorAll('[data-page]').forEach(el => {
+                            const p = parseInt(el.getAttribute('data-page'));
+                            if (p && p > 0) pages.add(p);
+                        });
+                        // 2. Elementos con clase .facetwp-page o dentro de .facetwp-pager
+                        document.querySelectorAll('.facetwp-page, [class*="facetwp-pager"] a, [class*="facetwp-pager"] span, [class*="facetwp-pager"] button').forEach(el => {
+                            const txt = el.innerText ? el.innerText.trim() : '';
+                            if (/^\\d+$/.test(txt)) {
+                                const p = parseInt(txt);
+                                if (p > 0) pages.add(p);
+                            }
+                        });
+                        // 3. Enlaces con fwp_paged en href
+                        document.querySelectorAll('a[href*="fwp_paged"]').forEach(el => {
+                            const m = el.getAttribute('href').match(/fwp_paged=(\\d+)/);
+                            if (m) pages.add(parseInt(m[1]));
+                        });
+                        // 4. Botón Next / siguiente
+                        document.querySelectorAll('.facetwp-page.next, a[rel="next"]').forEach(el => {
+                            const dp = el.getAttribute('data-page');
+                            if (dp && /^\\d+$/.test(dp)) pages.add(parseInt(dp));
+                        });
+                        return Array.from(pages);
+                    }''')
+                    for p in sorted(discovered_cov_pages):
+                        if p > 1:
+                            parsed_cur = urlparse(url)
+                            cur_params = parse_qs(parsed_cur.query)
+                            for k, v in query_params.items():
+                                if k not in cur_params:
+                                    cur_params[k] = v
+                            cur_params["fwp_paged"] = [str(p)]
+                            new_cov_url = parsed_cur._replace(query=urlencode(cur_params, doseq=True), fragment="").geturl()
+                            if new_cov_url not in visited_scrape_urls and new_cov_url not in urls_to_process:
+                                urls_to_process.append(new_cov_url)
+                                print(f"[*] Detectada página adicional de Covivio (fwp_paged={p}): {new_cov_url}", flush=True)
+                except Exception as e:
+                    print(f"[*] Advertencia procesando paginación de Covivio: {e}", flush=True)
+
+            # --- DETECCIÓN DINÁMICA DE PAGINACIÓN GENERAL (ej. Icade y webs paginadas, excluyendo URW que ya expande en el DOM) ---
+            if "urw.com" not in parsed_target.netloc:
+                pagination_selectors = [
+                    ".pagination a[href]",
+                    "ul.pagination-pages a[href]",
+                    "ul.pagination a[href]",
+                    "nav[aria-label*='pagination' i] a[href]",
+                    "[class*='pagination' i] a[href]",
+                    "[class*='pager' i] a[href]",
+                    "[class*='facetwp' i] a[href]",
+                    ".facetwp-pager a[href]",
+                    "a.facetwp-page[href]",
+                    ".pager a[href]",
+                    "a.page-link[href]",
+                    "a[rel='next'][href]",
+                    "a[href*='page=']",
+                    "a[href*='paged=']",
+                    "a[href*='fwp_paged=']",
+                ]
+                for sel in pagination_selectors:
+                    try:
+                        pag_elements = await page.locator(sel).all()
+                        for pel in pag_elements:
+                            p_href = await pel.get_attribute("href")
+                            if p_href:
+                                full_pag_url = merge_pagination_url(url, p_href)
+                                if not full_pag_url:
+                                    continue
+                                parsed_pag = urlparse(full_pag_url)
+                                # Asegurar que pertenezca al mismo dominio y mantenga la ruta base de publicaciones
+                                if parsed_pag.netloc == parsed_target.netloc and parsed_pag.path.rstrip('/') == parsed_target.path.rstrip('/'):
+                                    if full_pag_url not in visited_scrape_urls and full_pag_url not in urls_to_process:
+                                        urls_to_process.append(full_pag_url)
+                                        print(f"[*] Detectada página adicional de paginación: {full_pag_url}", flush=True)
+                    except Exception:
+                        pass
 
         # --- FALLBACK CRAWLEE (Potenciado) ---
         if len(target_pdfs) < 5: # Si el método nativo falla o encuentra muy poco
@@ -1056,7 +1320,7 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                     await ctx.enqueue_links(regex=r"https://ir\.merlinproperties\.com/.*")
                 # Seguir enlaces de paginación en Crawlee si se presentan
                 await ctx.enqueue_links(
-                    selector=".pagination a[href], ul.pagination-pages a[href], nav[aria-label*='pagination' i] a[href], .pager a[href]"
+                    selector=".pagination a[href], [class*='pagination' i] a[href], [class*='pager' i] a[href], [class*='facetwp' i] a[href], ul.pagination-pages a[href], nav[aria-label*='pagination' i] a[href], .pager a[href], a[href*='page='], a[href*='fwp_paged=']"
                 )
 
             await crawler.run(list(visited_scrape_urls) if visited_scrape_urls else urls_to_scrape)
@@ -1064,19 +1328,96 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
             target_pdfs = list(set(target_pdfs)) # Limpiar duplicados de URLs
 
         # --- DEDUPLICACIÓN FINAL POR NOMBRE ---
-        target_pdfs = list(set(target_pdfs)) # Unique URLs
+        target_pdfs = sorted(list(set(target_pdfs))) # Unique URLs ordenadas de forma determinista
         unique_pdfs_map = {}
+        custom_filenames_map = {}
         for url in target_pdfs:
-            fname = url.split("/")[-1].split("?")[0]
-            if not fname.lower().endswith(".pdf"): fname = "document.pdf"
+            fname = unquote(url.split("/")[-1].split("?")[0])
+            if fname.lower().endswith(".zip") and "landsec.com" in parsed_target.netloc:
+                unique_pdfs_map[fname] = url
+                custom_filenames_map[url] = fname
+                continue
+            if not fname.lower().endswith(".pdf"):
+                if "vonovia.com" in parsed_target.netloc and "/content/download/" in url:
+                    v_parts = [p for p in url.split("?")[0].split("/") if p]
+                    fname = f"vonovia_{v_parts[-2]}_{v_parts[-1]}.pdf" if len(v_parts) >= 2 else f"vonovia_{fname}.pdf"
+                elif "klepierre.com" in parsed_target.netloc and fname:
+                    fname = f"{fname}.pdf"
+                else:
+                    fname = "document.pdf"
             if fname not in unique_pdfs_map:
                 unique_pdfs_map[fname] = url
+                custom_filenames_map[url] = fname
+            elif "urw.com" in parsed_target.netloc or "vonovia.com" in parsed_target.netloc or "klepierre.com" in parsed_target.netloc:
+                # Si documentos de distintos años comparten nombre base en el CDN, los desambiguamos con el segmento previo de la ruta
+                url_parts = [p for p in url.split("?")[0].split("/") if p]
+                prefix = url_parts[-2][:8] if len(url_parts) >= 2 else "dup"
+                alt_fname = f"{prefix}_{fname}"
+                unique_pdfs_map[alt_fname] = url
+                custom_filenames_map[url] = alt_fname
         
         final_list = list(unique_pdfs_map.values())
         print(f"Filtrado final: {len(target_pdfs)} URLs -> {len(final_list)} Archivos Únicos")
 
         async with AsyncSessionLocal() as session:
             for pdf_url in final_list:
+                # Caso especial Landsec: paquetes históricos .zip que contienen múltiples PDFs financieros
+                if pdf_url.lower().endswith(".zip") and "landsec.com" in parsed_target.netloc:
+                    try:
+                        dl_headers = {
+                            "User-Agent": fake_user_agent,
+                            "Referer": target_url,
+                        }
+                        dl_timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+                        async with httpx.AsyncClient(verify=False, timeout=dl_timeout, follow_redirects=True) as z_client:
+                            z_req = await z_client.get(pdf_url, headers=dl_headers)
+                            z_req.raise_for_status()
+                            z_bytes = z_req.content
+                        with zipfile.ZipFile(io.BytesIO(z_bytes)) as zf:
+                            for member in zf.namelist():
+                                if member.startswith("__MACOSX") or "/." in member or os.path.basename(member).startswith("._"):
+                                    continue
+                                if not member.lower().endswith(".pdf"):
+                                    continue
+                                z_fname = os.path.basename(member)
+                                z_source_url = f"{pdf_url}#{z_fname}"
+                                res_z = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.source_url == z_source_url))
+                                if res_z.scalars().first():
+                                    skipped += 1
+                                    continue
+                                res_zname = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.filename == z_fname))
+                                if res_zname.scalars().first():
+                                    skipped += 1
+                                    continue
+                                pdf_bytes = zf.read(member)
+                                drive_item_id, list_item_id = await upload_to_sp(z_fname, pdf_bytes, SP_PDF_FOLDER)
+                                if not drive_item_id:
+                                    failed_files.append(z_fname)
+                                    continue
+                                tags_synced_flag = 0
+                                if list_item_id and (area_tag or empresa_tag):
+                                    tag_ok, _ = await update_sp_metadata(list_item_id, area_tag, empresa_tag)
+                                    tags_synced_flag = 1 if tag_ok else 0
+                                elif not (area_tag or empresa_tag):
+                                    tags_synced_flag = 1
+                                session.add(ScrapedPDF(
+                                    filename=z_fname,
+                                    source_url=z_source_url,
+                                    size_bytes=len(pdf_bytes),
+                                    parent_target_url=target_url,
+                                    drive_item_id=drive_item_id,
+                                    list_item_id=list_item_id,
+                                    area_tag=area_tag,
+                                    empresa_tag=empresa_tag,
+                                    tags_synced=tags_synced_flag
+                                ))
+                                await session.commit()
+                                downloaded += 1
+                                print(f"[OK ZIP->PDF] {z_fname} extraído y guardado en SP.", flush=True)
+                    except Exception as e:
+                        print(f"[Error ZIP Landsec] {pdf_url}: {e}", flush=True)
+                    continue
+
                 # 1. Idempotency check by URL
                 res = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.source_url == pdf_url))
                 if res.scalars().first():
@@ -1084,7 +1425,7 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                     continue
                 
                 # 2. Idempotency check by Filename
-                filename = pdf_url.split("/")[-1].split("?")[0]
+                filename = custom_filenames_map.get(pdf_url) or unquote(pdf_url.split("/")[-1].split("?")[0])
                 if not filename.lower().endswith(".pdf"): filename = f"doc_{downloaded}.pdf"
                 
                 res_name = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.filename == filename))
@@ -1109,10 +1450,29 @@ async def run_merlin_scraper(target_url: str, area_tag: Optional[str] = None, em
                             "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
                         }
                         dl_timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-                        async with httpx.AsyncClient(cookies=cookies_dict, verify=False, timeout=dl_timeout) as dl_client:
+                        async with httpx.AsyncClient(cookies=cookies_dict, verify=False, timeout=dl_timeout, follow_redirects=True) as dl_client:
                             req = await dl_client.get(pdf_url, headers=dl_headers)
                             req.raise_for_status()
                             file_content = req.content
+
+                        # Si la URL no terminaba explícitamente en .pdf (ej. Vonovia /content/download/ o Klépierre /en/finance/),
+                        # validamos que el contenido sea realmente un PDF y extraemos su nombre oficial de Content-Disposition si existe.
+                        if not pdf_url.split("?")[0].lower().endswith(".pdf"):
+                            ctype = (req.headers.get("content-type") or "").lower()
+                            if "pdf" not in ctype and not file_content.startswith(b"%PDF"):
+                                print(f"[*] Omitiendo {pdf_url}: el recurso devuelto no es un PDF ({ctype}).", flush=True)
+                                skipped += 1
+                                file_failed = False
+                                break
+                            cd_fname = extract_filename_from_cd(req.headers.get("content-disposition"))
+                            if cd_fname:
+                                filename = cd_fname
+                                res_cd = await session.execute(select(ScrapedPDF).filter(ScrapedPDF.filename == filename))
+                                if res_cd.scalars().first():
+                                    print(f"Saltando duplicado por nombre oficial (Content-Disposition): {filename}", flush=True)
+                                    skipped += 1
+                                    file_failed = False
+                                    break
                         
                         print(f"[Intento {attempt}/{MAX_ATTEMPTS}] Descargado {filename} ({len(file_content)//1024} KB). Subiendo a SP...", flush=True)
                         drive_item_id, list_item_id = await upload_to_sp(filename, file_content, SP_PDF_FOLDER)
